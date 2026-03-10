@@ -165,6 +165,38 @@ class LiveAPISession:
     - エラーハンドリング (仕様書 セクション9)
     """
 
+    # ========================================
+    # 初期あいさつ用ダミーメッセージ（モード別・言語別）
+    # ========================================
+    # 【設計意図】
+    # LiveAPI は response_modalities: ["AUDIO"] で動作するため、
+    # AI側から先に話し始めることができない（ユーザー入力が必要）。
+    # そのため、セッション開始時にサーバー側からダミーの
+    # ユーザーメッセージを send_client_content() で送信し、
+    # AIの初期あいさつ音声応答をトリガーする。
+    #
+    # 【根拠】stt_stream.py:766-776 の再接続時パターンと同じ手法:
+    #   await session.send_client_content(
+    #       turns=types.Content(role="user", parts=[types.Part(text="...")]),
+    #       turn_complete=True
+    #   )
+    # ========================================
+
+    INITIAL_GREETING_TRIGGERS = {
+        'chat': {
+            'ja': 'こんにちは。お店探しを手伝ってください。',
+            'en': 'Hello. I need help finding a restaurant.',
+            'zh': '你好，请帮我找餐厅。',
+            'ko': '안녕하세요. 레스토랑을 찾아주세요.',
+        },
+        'concierge': {
+            'ja': 'こんにちは。',
+            'en': 'Hello.',
+            'zh': '你好。',
+            'ko': '안녕하세요.',
+        },
+    }
+
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str):
         self.session_id = session_id
@@ -281,8 +313,29 @@ class LiveAPISession:
                         model=LIVE_API_MODEL,
                         config=config
                     ) as session:
-                        if self.session_count > 1:
-                            # 仕様書 セクション6.3: 再接続時のテキスト送信
+
+                        if self.session_count == 1:
+                            # ★ 初回接続: ダミーメッセージで初期あいさつを発火
+                            # LiveAPIは response_modalities: ["AUDIO"] のため
+                            # AI側から先に話し始められない。
+                            # ユーザーからのダミー問いかけを送信して
+                            # AIの初期あいさつ音声応答をトリガーする。
+                            # （stt_stream.py:766-776 の再接続パターンと同じ手法）
+                            trigger_msgs = self.INITIAL_GREETING_TRIGGERS
+                            mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
+                            dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
+
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text=dummy_text)]
+                                ),
+                                turn_complete=True
+                            )
+                            logger.info(f"[LiveAPI] 初期あいさつトリガー送信: '{dummy_text}'")
+
+                        else:
+                            # 再接続時: 仕様書 セクション6.3
                             await session.send_client_content(
                                 turns=types.Content(
                                     role="user",
@@ -616,6 +669,129 @@ socket.on('interrupted', () => {
     liveAudioManager.onAiResponseEnded();
 });
 ```
+
+---
+
+## 4.5 初期あいさつのLiveAPI統一
+
+### 4.5.1 現行方式の問題点
+
+現行では `SupportAssistant.get_initial_message()` がテキスト文字列を返し、
+フロントエンドが REST API 経由で TTS 再生 + チャット欄表示する方式。
+
+LiveAPI化した場合、通常会話は LiveAPI 経由の音声 + transcription なのに、
+初期あいさつだけ REST + TTS という**処理経路の不一致**が生まれる。
+
+### 4.5.2 新方式: ダミーメッセージで初期あいさつをトリガー
+
+LiveAPI は `response_modalities: ["AUDIO"]` で動作するため、
+**AI側から先に話し始めることができない**（ユーザー入力が必要）。
+
+この制約を回避するため、セッション開始時にサーバー側からダミーの
+ユーザーメッセージを `send_client_content()` で送信し、
+AIの初期あいさつ音声応答をトリガーする。
+
+**根拠**: stt_stream.py:766-776 で再接続時に同じパターンを使用:
+```python
+await session.send_client_content(
+    turns=types.Content(role="user", parts=[types.Part(text="続きをお願いします")]),
+    turn_complete=True
+)
+```
+
+### 4.5.3 初期あいさつフロー
+
+```
+ブラウザ                   サーバー                         Gemini LiveAPI
+  │                          │                                │
+  ├─ emit('live_start') ──→ │                                │
+  │                          ├─ LiveAPI接続 ─────────────────→│
+  │                          │                                │
+  │  （ユーザーは何もしていない）                               │
+  │                          │                                │
+  │                          ├─ send_client_content() ──────→│
+  │                          │  "こんにちは。お店探しを        │
+  │                          │   手伝ってください。"            │
+  │                          │  (ダミーメッセージ)              │
+  │                          │                                │
+  │                          │←─ AI音声応答 ─────────────────│
+  │                          │  「こんにちは！どんなお店を     │
+  │                          │   お探しですか？」              │
+  │                          │                                │
+  │ ←─ emit('live_audio') ─ │  (音声PCM)                     │
+  │ ←─ emit('ai_transcript')│  (文字起こし)                   │
+  │                          │                                │
+  │  ★ ユーザーに聞こえる:                                    │
+  │  「こんにちは！どんなお店をお探しですか？」                  │
+  │  ★ チャット欄に表示:                                      │
+  │  AI: こんにちは！どんなお店をお探しですか？                  │
+  │                                                           │
+  │  （以降、ユーザーがマイクで話し始める）                     │
+```
+
+### 4.5.4 ダミーメッセージの設計
+
+ダミーメッセージはチャット欄に**表示しない**。
+ユーザーには「AIが先に話しかけてくれた」ように見える。
+
+```python
+# バックエンド側（LiveAPISession クラス変数）
+INITIAL_GREETING_TRIGGERS = {
+    'chat': {
+        'ja': 'こんにちは。お店探しを手伝ってください。',
+        'en': 'Hello. I need help finding a restaurant.',
+        'zh': '你好，请帮我找餐厅。',
+        'ko': '안녕하세요. 레스토랑을 찾아주세요.',
+    },
+    'concierge': {
+        'ja': 'こんにちは。',
+        'en': 'Hello.',
+        'zh': '你好。',
+        'ko': '안녕하세요.',
+    },
+}
+```
+
+**chatモード**: 用途を含めたメッセージ → AIがお店探しの文脈で応答
+**conciergeモード**: シンプルな挨拶 → AIがシステムプロンプトに従い名前を聞く等
+
+### 4.5.5 ブラウザ側の変更
+
+```typescript
+// 初期あいさつの制御
+socket.on('ai_transcript', (data) => {
+    // ★ ダミーメッセージのユーザー発話は表示しない
+    //   （サーバー側で user_transcript を送信しないことで対処）
+    // AI発話のみチャット欄に表示
+    updateAiTranscript(data.text);
+});
+```
+
+サーバー側で、ダミーメッセージに対する `input_transcription` は
+ブラウザに転送しない（ユーザーが実際に話したわけではないため）:
+
+```python
+# _receive_and_forward() 内
+if hasattr(sc, 'input_transcription') and sc.input_transcription:
+    text = sc.input_transcription.text
+    if text and not self._is_initial_greeting_phase:
+        # ★ 初期あいさつフェーズのinput_transcriptionは転送しない
+        self.socketio.emit('user_transcript',
+            {'text': text}, room=self.client_sid)
+```
+
+### 4.5.6 現行 get_initial_message() との関係
+
+| | 現行 (REST API) | 新設計 (LiveAPI) |
+|---|---|---|
+| 初期あいさつ生成 | `SupportAssistant.get_initial_message()` | LiveAIが音声で応答 |
+| テキスト表示 | REST レスポンスをチャット欄に表示 | `output_transcription` をチャット欄に表示 |
+| 音声再生 | Google TTS (`/api/tts/synthesize`) | LiveAPIの音声出力を直接再生 |
+| コンシェルジュ初回 | 「何とお呼びすれば？」(ハードコード) | システムプロンプトの指示でAIが判断 |
+| リピーター対応 | profile読み込み→名前呼びかけ(ハードコード) | システムプロンプトにprofile注入→AIが判断 |
+
+**`get_initial_message()` は廃止ではなくフォールバック用に残す**
+（LiveAPI接続失敗時にREST APIモードで使用）
 
 ---
 
