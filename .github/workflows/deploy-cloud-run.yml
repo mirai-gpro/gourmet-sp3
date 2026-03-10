@@ -87,5 +87,5 @@ jobs:
       - name: Health check
         run: |
           echo "Waiting for service to be ready..."
-          sleep 10
+          sleep 15
           curl -sf "${{ env.SERVICE_URL }}/health" | python3 -m json.tool || echo "Health check pending (cold start)"
