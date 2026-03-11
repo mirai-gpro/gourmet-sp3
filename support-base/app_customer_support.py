@@ -17,6 +17,7 @@ import base64
 import logging
 import threading
 import queue
+import asyncio
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
@@ -40,6 +41,7 @@ from support_core import (
     SupportSession,
     SupportAssistant
 )
+from live_api_handler import LiveAPISession
 
 # ロギング設定
 logging.basicConfig(
@@ -740,6 +742,7 @@ def health_check():
 # ========================================
 
 active_streams = {}
+active_live_sessions = {}
 
 @socketio.on('connect')
 def handle_connect():
@@ -748,12 +751,22 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    logger.info(f"[WebSocket STT] クライアント切断: {request.sid}")
-    if request.sid in active_streams:
-        stream_data = active_streams[request.sid]
+    client_sid = request.sid
+    logger.info(f"[WebSocket] クライアント切断: {client_sid}")
+
+    # LiveAPIセッションのクリーンアップ
+    if client_sid in active_live_sessions:
+        live_session = active_live_sessions[client_sid]
+        live_session.stop()
+        del active_live_sessions[client_sid]
+        logger.info(f"[LiveAPI] 切断によるセッションクリーンアップ: {client_sid}")
+
+    # STTストリームのクリーンアップ
+    if client_sid in active_streams:
+        stream_data = active_streams[client_sid]
         if 'stop_event' in stream_data:
             stream_data['stop_event'].set()
-        del active_streams[request.sid]
+        del active_streams[client_sid]
 
 @socketio.on('start_stream')
 def handle_start_stream(data):
@@ -879,6 +892,92 @@ def handle_stop_stream():
         del active_streams[request.sid]
 
     emit('stream_stopped', {'status': 'stopped'})
+
+
+# ========================================
+# LiveAPI WebSocket Events
+# ========================================
+
+@socketio.on('live_start')
+def handle_live_start(data):
+    """LiveAPIセッション開始"""
+    client_sid = request.sid
+    session_id = data.get('session_id')
+    mode = data.get('mode', 'chat')
+    language = data.get('language', 'ja')
+
+    logger.info(f"[LiveAPI] セッション開始: client={client_sid}, "
+                f"session={session_id}, mode={mode}, lang={language}")
+
+    # 既存のLiveAPIセッションがあれば停止
+    if client_sid in active_live_sessions:
+        old_session = active_live_sessions[client_sid]
+        old_session.stop()
+        del active_live_sessions[client_sid]
+
+    # LiveAPIセッション作成
+    live_session = LiveAPISession(
+        session_id=session_id,
+        mode=mode,
+        language=language,
+        socketio=socketio,
+        client_sid=client_sid
+    )
+    active_live_sessions[client_sid] = live_session
+
+    # 別スレッドでasyncioイベントループを実行
+    def start_live_session_thread(session):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(session.run())
+        except Exception as e:
+            logger.error(f"[LiveAPI] スレッドエラー: {e}")
+        finally:
+            loop.close()
+
+    thread = threading.Thread(
+        target=start_live_session_thread,
+        args=(live_session,),
+        daemon=True
+    )
+    thread.start()
+
+    emit('live_ready', {'status': 'connected'})
+
+
+@socketio.on('live_audio_in')
+def handle_live_audio_in(data):
+    """ブラウザ → LiveAPI 音声データ"""
+    client_sid = request.sid
+    live_session = active_live_sessions.get(client_sid)
+
+    if not live_session or not live_session.is_running:
+        return
+
+    audio_b64 = data.get('data', '')
+    if not audio_b64:
+        return
+
+    try:
+        pcm_bytes = base64.b64decode(audio_b64)
+        live_session.enqueue_audio(pcm_bytes)
+    except Exception as e:
+        logger.error(f"[LiveAPI] 音声デコードエラー: {e}")
+
+
+@socketio.on('live_stop')
+def handle_live_stop():
+    """LiveAPIセッション終了"""
+    client_sid = request.sid
+    logger.info(f"[LiveAPI] セッション停止: client={client_sid}")
+
+    if client_sid in active_live_sessions:
+        live_session = active_live_sessions[client_sid]
+        live_session.stop()
+        del active_live_sessions[client_sid]
+
+    emit('live_stopped', {'status': 'disconnected'})
 
 
 if __name__ == '__main__':
