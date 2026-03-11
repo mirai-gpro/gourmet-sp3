@@ -742,13 +742,17 @@ def health_check():
 # ========================================
 
 def _shop_search_internal(session_id: str, user_request: str,
-                          language: str, mode: str) -> dict:
+                          language: str, mode: str,
+                          conversation_history: list = None) -> dict:
     """
     LiveAPIセッションから呼ばれるショップ検索コールバック
     （仕様書02v2 セクション5.4.1）
 
     既存の SupportAssistant.process_user_message() を内部的に呼び出し、
     ショップデータ(JSON)のみを返す。音声生成はしない。
+
+    Args:
+        conversation_history: LiveAPI側の会話履歴（SupportSessionに注入）
     """
     try:
         session = SupportSession(session_id)
@@ -759,7 +763,15 @@ def _shop_search_internal(session_id: str, user_request: str,
 
         session.update_language(language)
         session.update_mode(mode)
-        session.add_message('user', user_request, 'chat')
+
+        # LiveAPIの会話履歴をSupportSessionに注入（コンテキスト補完）
+        if conversation_history:
+            for h in conversation_history:
+                role = 'model' if h.get('role') == 'ai' else 'user'
+                session.add_message(role, h.get('text', ''), 'chat')
+            logger.info(f"[ShopSearch] LiveAPI会話履歴 {len(conversation_history)}件を注入")
+        else:
+            session.add_message('user', user_request, 'chat')
 
         assistant = SupportAssistant(session, SYSTEM_PROMPTS)
         result = assistant.process_user_message(user_request, 'conversation')

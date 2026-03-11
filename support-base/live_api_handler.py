@@ -388,7 +388,7 @@ class LiveAPISession:
                         if self._shop_search_pending:
                             pending = self._shop_search_pending
                             self._shop_search_pending = None
-                            await self._handle_shop_search(pending['user_request'])
+                            await self._handle_shop_search(pending)
                             # ショップ説明完了後、通常会話に復帰するため
                             # is_running/needs_reconnect は _handle_shop_search 内で設定済み
                             continue
@@ -575,7 +575,12 @@ class LiveAPISession:
                 user_request = self._build_search_request(user_text)
                 logger.info(f"[LiveAPI] ショップ検索トリガー検知: '{ai_text}' → ユーザー要望: '{user_request}'")
                 # v2: ブラウザにemitせず、サーバー側でショップ検索→LiveAPI説明を実行
-                self._shop_search_pending = {'user_request': user_request}
+                # AIテキストにはAIが理解した検索条件が含まれる（例: "六本木エリアでフレンチ"）
+                self._shop_search_pending = {
+                    'user_request': user_request,
+                    'ai_trigger_text': ai_text,
+                    'conversation_history': list(self.conversation_history),
+                }
                 self.is_running = False  # session_loopを終了させる
                 self.ai_transcript_buffer = ""
                 return  # 再接続判定をスキップ
@@ -693,7 +698,7 @@ class LiveAPISession:
     # ショップ検索 → LiveAPI説明フロー（仕様書02v2 セクション5.4）
     # ============================================================
 
-    async def _handle_shop_search(self, user_request: str):
+    async def _handle_shop_search(self, pending: dict):
         """
         ショップ検索トリガー検知後の処理（仕様書02v2 セクション5.4.1）
 
@@ -701,11 +706,28 @@ class LiveAPISession:
         2. ブラウザにショップカードデータを送信
         3. LiveAPI再接続で1軒ずつ音声説明
         4. 通常会話に復帰
+
+        Args:
+            pending: {
+                'user_request': str,         # ユーザー発言ベースの検索テキスト
+                'ai_trigger_text': str,      # AIのトリガー発話（検索条件を含む）
+                'conversation_history': list, # LiveAPI会話履歴
+            }
         """
-        logger.info(f"[ShopSearch] 検索開始: '{user_request}'")
+        user_request = pending.get('user_request', '')
+        ai_trigger_text = pending.get('ai_trigger_text', '')
+        conversation_history = pending.get('conversation_history', [])
+
+        # AIの解釈テキストを検索クエリに含める（ガーブルされた音声認識を補完）
+        # 例: ユーザー "フレンチかな" + AI "六本木エリアでフレンチをお探ししますね"
+        search_query = user_request
+        if ai_trigger_text:
+            search_query = f"{ai_trigger_text}\nユーザーの要望: {user_request}"
+
+        logger.info(f"[ShopSearch] 検索開始: query='{search_query[:100]}'")
 
         # ① REST APIでショップデータを取得（コールバック経由）
-        shop_data = await self._fetch_shop_data(user_request)
+        shop_data = await self._fetch_shop_data(search_query, conversation_history)
 
         if not shop_data or not shop_data.get('shops'):
             # ショップが見つからない → LiveAPIで伝えて通常会話に復帰
@@ -729,7 +751,8 @@ class LiveAPISession:
         # ③ ショップ説明をLiveAPIで1軒ずつ読み上げ
         await self._describe_shops_via_live(shops)
 
-    async def _fetch_shop_data(self, user_request: str) -> dict:
+    async def _fetch_shop_data(self, search_query: str,
+                              conversation_history: list = None) -> dict:
         """
         ショップデータをREST API経由で取得（仕様書02v2 セクション5.4.1）
 
@@ -745,9 +768,10 @@ class LiveAPISession:
             result = await asyncio.to_thread(
                 self._shop_search_callback,
                 self.session_id,
-                user_request,
+                search_query,
                 self.language,
-                self.mode
+                self.mode,
+                conversation_history
             )
             return result
         except Exception as e:
@@ -920,7 +944,7 @@ class LiveAPISession:
         """
         self.is_running = True
         self.needs_reconnect = True  # run()のwhileループで再接続させる
-        self.session_count += 1
+        # session_count は run() のwhileループ先頭でインクリメントされるため、ここでは不要
         self.ai_char_count = 0
 
         # 会話履歴にショップ紹介の記録を追加（復帰時のコンテキスト用）
