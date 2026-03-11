@@ -758,9 +758,25 @@ def handle_live_start(data):
         del active_live_sessions[client_sid]
 
     # プロンプト構築（03_prompt_modification_spec.md セクション7.1参照）
-    # テストフェーズ: build_system_instruction() でハードコードから構築
-    # 将来: GCSから取得する形に差し替え可能
-    system_prompt = build_system_instruction(mode)
+    # コンシェルジュモードの場合、セッションからユーザープロファイルを取得
+    user_profile = None
+    if mode == 'concierge' and session_id:
+        try:
+            session = SupportSession(session_id)
+            session_data = session.get_data()
+            if session_data:
+                is_first_visit = session_data.get('is_first_visit', True)
+                profile = session_data.get('long_term_profile') or {}
+                user_profile = {
+                    'is_first_visit': is_first_visit,
+                    'preferred_name': profile.get('preferred_name', ''),
+                    'name_honorific': profile.get('name_honorific', ''),
+                }
+                logger.info(f"[LiveAPI] ユーザープロファイル取得: first_visit={is_first_visit}, name={profile.get('preferred_name', '')}")
+        except Exception as e:
+            logger.warning(f"[LiveAPI] プロファイル取得エラー: {e}")
+
+    system_prompt = build_system_instruction(mode, user_profile=user_profile)
 
     # LiveAPIセッション作成
     live_session = LiveAPISession(
