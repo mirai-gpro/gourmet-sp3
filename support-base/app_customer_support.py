@@ -770,10 +770,8 @@ def _shop_search_internal(session_id: str, user_request: str,
                 role = 'model' if h.get('role') == 'ai' else 'user'
                 session.add_message(role, h.get('text', ''), 'chat')
             logger.info(f"[ShopSearch] LiveAPI会話履歴 {len(conversation_history)}件を注入")
-
-        # 検索クエリを最終ユーザーメッセージとして必ず追加
-        # （Gemini APIは最後がuser messageでないとショップ検索を実行しない）
-        session.add_message('user', user_request, 'chat')
+        else:
+            session.add_message('user', user_request, 'chat')
 
         assistant = SupportAssistant(session, SYSTEM_PROMPTS)
         result = assistant.process_user_message(user_request, 'conversation')
