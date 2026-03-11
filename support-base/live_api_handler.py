@@ -614,18 +614,32 @@ class LiveAPISession:
 
     def _build_search_request(self, current_user_text: str) -> str:
         """会話履歴からショップ検索用のリクエストテキストを構築"""
-        # 現在のターンのユーザー発言があればそれを優先
+        # v3: コンシェルジュモードで短期記憶があれば構造化された検索リクエストを作成
+        if self.mode == 'concierge' and any(self.short_term_memory.values()):
+            labels = {
+                'area': 'エリア', 'purpose': '利用目的', 'cuisine': 'ジャンル',
+                'atmosphere': '雰囲気', 'party_size': '人数', 'budget': '予算',
+                'date': '日時',
+            }
+            conditions = []
+            for key, label in labels.items():
+                value = self.short_term_memory[key]
+                if value:
+                    conditions.append(f"{label}: {value}")
+            request = "以下の条件でお店を探してください。\n" + "\n".join(conditions)
+            logger.info(f"[LiveAPI] 構造化検索リクエスト: {request}")
+            return request
+
+        # フォールバック: 会話履歴からユーザー発言を収集
         if current_user_text:
-            # 直近の会話コンテキストも付加（条件が分散している場合）
             context_parts = [current_user_text]
-            for h in reversed(self.conversation_history[:-1]):  # 最後（今追加した分）は除く
+            for h in reversed(self.conversation_history[:-1]):
                 if h['role'] == 'user' and h['text'] != current_user_text:
                     context_parts.insert(0, h['text'])
                     if len(context_parts) >= 3:
                         break
             return '。'.join(context_parts)
 
-        # 現在のターンにユーザー発言がない場合、履歴から収集
         user_texts = []
         for h in reversed(self.conversation_history):
             if h['role'] == 'user':

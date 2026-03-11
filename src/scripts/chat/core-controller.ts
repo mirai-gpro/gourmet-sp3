@@ -555,7 +555,7 @@ export class CoreController {
         body: JSON.stringify({
           session_id: this.sessionId,
           message: message,
-          stage: this.currentStage,
+          stage: 'shop_search',
           language: this.currentLanguage,
           mode: this.currentMode
         })

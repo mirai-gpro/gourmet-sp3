@@ -282,6 +282,16 @@ def chat():
                         session.add_message(role, h['text'], 'chat')
                     logger.info(f"[Chat] LiveAPI会話履歴をSupportSessionに注入: {len(live_history)}件")
 
+        # v3: LiveAPIからのショップ検索リクエストの場合、
+        # 検索指示を明示的に追加（LLMが追加質問せずshopsを返すようにする）
+        if stage == 'shop_search':
+            search_directive = (
+                "\n\n【指示】上記の条件でお店を検索し、JSON形式でshops配列を含めて返してください。"
+                "追加の質問はせず、今ある条件でお店を提案してください。"
+            )
+            user_message = user_message + search_directive
+            logger.info(f"[Chat] ショップ検索モード: 検索指示を追加")
+
         session.add_message('user', user_message, 'chat')
 
         # 3. 知能生成 (Assistant作成)
