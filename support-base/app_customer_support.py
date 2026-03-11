@@ -266,6 +266,22 @@ def chat():
         session.update_mode(mode)
 
         # 2. ユーザー入力を記録
+        # v3: LiveAPI会話履歴をSupportSessionに注入
+        # LiveAPIモードでの会話はSupportSessionに記録されないため、
+        # ショップ検索でREST APIが呼ばれた時に会話文脈をLLMに渡す必要がある
+        if session_id in _live_session_state_store:
+            saved_state = _live_session_state_store[session_id]
+            live_history = saved_state.get('conversation_history', [])
+            if live_history:
+                existing_msgs = session.get_data().get('messages', [])
+                # 既にLiveAPI履歴を注入済みでない場合のみ（重複防止）
+                chat_msgs = [m for m in existing_msgs if m.get('type') == 'chat']
+                if len(chat_msgs) <= 2:
+                    for h in live_history:
+                        role = 'user' if h['role'] == 'user' else 'model'
+                        session.add_message(role, h['text'], 'chat')
+                    logger.info(f"[Chat] LiveAPI会話履歴をSupportSessionに注入: {len(live_history)}件")
+
         session.add_message('user', user_message, 'chat')
 
         # 3. 知能生成 (Assistant作成)
