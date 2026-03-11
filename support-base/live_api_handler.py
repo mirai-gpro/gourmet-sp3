@@ -159,14 +159,26 @@ def _get_returning_user_context(preferred_name: str, name_honorific: str) -> str
 # ============================================================
 
 SHOP_TRIGGER_KEYWORDS = [
+    # 基本形
     'お探ししますね', 'お調べしますね', '探してみますね',
-    'ご紹介しますね', 'おすすめ', '提案',
+    'ご紹介しますね',
+    # 丁寧形（コンシェルジュモード対応）
+    'お探しいたしますね', 'お調べいたしますね', '探してまいりますね',
+    'ご紹介いたしますね',
+    # 部分一致用（「お探ししますね」「お探しいたします」等を幅広くカバー）
+    'お探しします', 'お調べします', 'お探しいたします', 'お調べいたします',
+    '探してみます', 'ご紹介します', 'ご紹介いたします',
+    # その他バリエーション
+    'お店を探し', 'お店をお探し', '検索しますね', '検索いたしますね',
 ]
 
 
 def should_trigger_shop_search(ai_text: str) -> bool:
     """AI発話からショップ検索トリガーを検知"""
-    return any(kw in ai_text for kw in SHOP_TRIGGER_KEYWORDS)
+    if any(kw in ai_text for kw in SHOP_TRIGGER_KEYWORDS):
+        logger.info(f"[ShopTrigger] キーワード検知: '{ai_text[:50]}'")
+        return True
+    return False
 
 
 # ============================================================
@@ -541,8 +553,8 @@ class LiveAPISession:
 
             # ショップ検索トリガー検知（仕様書02 セクション5.2-5.4）
             if should_trigger_shop_search(ai_text):
-                # ユーザーの要望を会話履歴から構築
-                user_request = user_text or self._get_last_user_text()
+                # ユーザーの要望を会話履歴全体から構築
+                user_request = self._build_search_request(user_text)
                 logger.info(f"[LiveAPI] ショップ検索トリガー検知: '{ai_text}' → ユーザー要望: '{user_request}'")
                 self.socketio.emit('shop_search_trigger', {
                     'user_request': user_request,
@@ -550,6 +562,8 @@ class LiveAPISession:
                     'language': self.language,
                     'mode': self.mode
                 }, room=self.client_sid)
+            else:
+                logger.debug(f"[LiveAPI] トリガー未検知: '{ai_text[:50]}'")
 
             # 発言が途中で切れているかチェック
             is_incomplete = self._is_speech_incomplete(ai_text)
@@ -572,6 +586,28 @@ class LiveAPISession:
             elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
+
+    def _build_search_request(self, current_user_text: str) -> str:
+        """会話履歴からショップ検索用のリクエストテキストを構築"""
+        # 現在のターンのユーザー発言があればそれを優先
+        if current_user_text:
+            # 直近の会話コンテキストも付加（条件が分散している場合）
+            context_parts = [current_user_text]
+            for h in reversed(self.conversation_history[:-1]):  # 最後（今追加した分）は除く
+                if h['role'] == 'user' and h['text'] != current_user_text:
+                    context_parts.insert(0, h['text'])
+                    if len(context_parts) >= 3:
+                        break
+            return '。'.join(context_parts)
+
+        # 現在のターンにユーザー発言がない場合、履歴から収集
+        user_texts = []
+        for h in reversed(self.conversation_history):
+            if h['role'] == 'user':
+                user_texts.insert(0, h['text'])
+                if len(user_texts) >= 3:
+                    break
+        return '。'.join(user_texts) if user_texts else "おすすめのお店を探してください"
 
     def _get_last_user_text(self) -> str:
         """会話履歴から最後のユーザー発言を取得"""

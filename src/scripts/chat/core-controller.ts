@@ -542,20 +542,32 @@ export class CoreController {
     const sessionId = data.session_id || this.sessionId;
     console.log('[LiveAPI→REST] ショップ検索開始:', userRequest);
 
+    // ★ LiveAPIを停止してからREST検索（二重応答を防止）
+    this.terminateLiveSession();
+
     try {
       this.isProcessing = true;
+
+      // ユーザーリクエストが空の場合のフォールバック
+      const message = userRequest || 'おすすめのお店を探してください';
 
       const response = await fetch(`${this.apiBase}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
-          message: userRequest,
+          message: message,
           stage: this.currentStage,
           language: this.currentLanguage,
           mode: this.currentMode
         })
       });
+
+      if (!response.ok) {
+        console.error('[LiveAPI→REST] HTTPエラー:', response.status, response.statusText);
+        return;
+      }
+
       const result = await response.json();
 
       if (result.shops && result.shops.length > 0) {
@@ -581,6 +593,8 @@ export class CoreController {
         }
       } else if (result.response) {
         this.addMessage('assistant', result.response);
+      } else {
+        console.warn('[LiveAPI→REST] レスポンスにshopsもresponseもなし:', result);
       }
 
       console.log('[LiveAPI→REST] ショップ検索完了:', result.shops?.length || 0, '件');
@@ -588,6 +602,8 @@ export class CoreController {
       console.error('[LiveAPI→REST] ショップ検索エラー:', error);
     } finally {
       this.isProcessing = false;
+      // ★ 入力状態をリセットしてテキスト入力可能に
+      this.resetInputState();
     }
   }
 
