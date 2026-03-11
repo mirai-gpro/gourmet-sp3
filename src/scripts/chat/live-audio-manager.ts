@@ -2,10 +2,10 @@
 /**
  * Gemini LiveAPI 用 AudioStreamManager
  *
- * 【設計原則】
+ * 【設計原則】(仕様書02 セクション4.2)
  * - AudioContext/MediaStream/AudioWorkletNode はセッション中使い回し
- * - 全二重: VADはGemini側に委譲し、AI応答中もユーザー音声を送信し続ける
- *   (Q9: ユーザーの「割り込み」体験を損なわないため)
+ * - 半二重制御はフラグ（isAiSpeaking）で行う
+ * - VADはGemini側に委譲
  * - AI音声再生もWeb Audio APIで行う（iOS対策）
  */
 
@@ -48,6 +48,7 @@ export class LiveAudioManager {
     private sourceNode: MediaStreamAudioSourceNode | null = null;
     private socket: any = null;
 
+    public isAiSpeaking: boolean = false;
     private isStreaming: boolean = false;
 
     // PCM再生キュー（24kHz）
@@ -133,9 +134,10 @@ export class LiveAudioManager {
         this.audioWorkletNode = new AudioWorkletNode(this.audioContext, 'live-audio-processor');
         this.sourceNode.connect(this.audioWorkletNode);
 
-        // 5. 全二重: AI応答中もユーザー音声を送信し続ける（Q9: VADに委譲）
+        // 5. フラグによる送信制御
         this.audioWorkletNode.port.onmessage = (e) => {
             if (!this.isStreaming) return;
+            if (this.isAiSpeaking) return; // 半二重: AI応答中は送信しない
 
             const audioChunk: Int16Array = e.data.audioChunk;
             const base64 = arrayBufferToBase64(audioChunk.buffer);
@@ -216,6 +218,17 @@ export class LiveAudioManager {
         this.playbackQueue = [];
         this.isPlaying = false;
         this.nextPlayTime = 0;
+    }
+
+    // ========================================
+    // フラグ切り替え
+    // ========================================
+    onAiResponseStarted(): void {
+        this.isAiSpeaking = true;
+    }
+
+    onAiResponseEnded(): void {
+        this.isAiSpeaking = false;
     }
 
     // ========================================

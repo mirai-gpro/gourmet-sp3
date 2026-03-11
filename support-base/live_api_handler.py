@@ -18,8 +18,10 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-# モデル名
+# stt_stream.py から転記（変更禁止）
 LIVE_API_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+MAX_AI_CHARS_BEFORE_RECONNECT = 800
+LONG_SPEECH_THRESHOLD = 500
 
 # ============================================================
 # プロンプト定義（03_prompt_modification_spec.md 準拠）
@@ -184,10 +186,11 @@ class LiveAPISession:
     """
     1つのブラウザクライアントに対応するLiveAPIセッション
 
-    - Live API接続設定: types.LiveConnectConfig による型安全な構成
-    - 音声送受信: 全二重（VADに委譲）
-    - コンテキスト管理: sliding_window による自動管理（手動再接続不要）
-    - エラーハンドリング: 接続エラー時のみリトライ
+    stt_stream.py の GeminiLiveApp を参考に、以下を移植:
+    - Live API接続設定 (仕様書 セクション5.2)
+    - 音声送受信 (仕様書 セクション7)
+    - 再接続メカニズム (仕様書 セクション8)
+    - エラーハンドリング (仕様書 セクション9)
     """
 
     # ========================================
@@ -225,53 +228,66 @@ class LiveAPISession:
         api_key = os.getenv("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key)
 
-        # 状態管理
+        # 状態管理（stt_stream.py:387-394 から転記）
         self.user_transcript_buffer = ""
         self.ai_transcript_buffer = ""
         self.conversation_history = []
+        self.ai_char_count = 0
+        self.needs_reconnect = False
+        self.session_count = 0
 
         # 非同期キュー
         self.audio_queue_to_gemini = None
         self.is_running = False
 
-    def _build_config(self):
+    def _build_config(self, with_context=None):
         """
-        Live API接続設定を構築（types.LiveConnectConfig 使用）
+        Live API接続設定を構築
 
-        Q1: 型付きオブジェクトでタイポ防止・IDE補完・将来的な変更への耐性確保
-        Q7: sliding_window により手動再接続は不要
-        Q9: VADに委譲し全二重対応（半二重制御不要）
+        【厳守】仕様書 セクション5.2 のconfig辞書をそのまま使う。
         """
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=types.Content(
-                parts=[types.Part(text=self.system_prompt)]
-            ),
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Aoede"
-                    )
-                ),
-                language_code=self._get_speech_language_code(),
-            ),
-            realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=False,
-                    start_of_speech_sensitivity="START_SENSITIVITY_HIGH",
-                    end_of_speech_sensitivity="END_SENSITIVITY_HIGH",
-                    prefix_padding_ms=100,
-                    silence_duration_ms=500,
-                )
-            ),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow(
-                    target_tokens=32000,
-                )
-            ),
-        )
+        instruction = self.system_prompt
+
+        if with_context:
+            last_user_message = ""
+            for h in reversed(self.conversation_history):
+                if h['role'] == 'user':
+                    last_user_message = h['text'][:100]
+                    break
+
+            instruction += f"""
+
+【これまでの会話の要約】
+{with_context}
+
+【重要：必ず守ること】
+1. 直前のユーザーの発言「{last_user_message}」に対して短い相槌を入れる
+2. 既に話した内容は繰り返さない
+"""
+
+        config = {
+            "response_modalities": ["AUDIO"],
+            "system_instruction": instruction,
+            "input_audio_transcription": {},
+            "output_audio_transcription": {},
+            "speech_config": {
+                "language_code": self._get_speech_language_code(),
+            },
+            "realtime_input_config": {
+                "automatic_activity_detection": {
+                    "disabled": False,
+                    "start_of_speech_sensitivity": "START_SENSITIVITY_HIGH",
+                    "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+                    "prefix_padding_ms": 100,
+                    "silence_duration_ms": 500,
+                }
+            },
+            "context_window_compression": {
+                "sliding_window": {
+                    "target_tokens": 32000,
+                }
+            },
+        }
         return config
 
     def _get_speech_language_code(self):
@@ -295,71 +311,86 @@ class LiveAPISession:
     def stop(self):
         """セッションを停止"""
         self.is_running = False
+        self.needs_reconnect = False
 
     async def run(self):
         """
-        メインループ
-
-        Q7: sliding_window が自動でコンテキスト管理するため、
-        手動の800文字再接続は不要。単一セッションを維持する。
-        エラー時のみ再接続を試みる。
+        メインループ（再接続対応）
+        仕様書 セクション6.1 の run() を移植
         """
         self.audio_queue_to_gemini = asyncio.Queue(maxsize=5)
         self.is_running = True
-        max_retries = 3
-        retry_count = 0
 
         try:
-            while self.is_running and retry_count <= max_retries:
-                config = self._build_config()
+            while self.is_running:
+                self.session_count += 1
+                self.ai_char_count = 0
+                self.needs_reconnect = False
+
+                context = None
+                if self.session_count > 1:
+                    context = self._get_context_summary()
+
+                config = self._build_config(with_context=context)
 
                 try:
                     async with self.client.aio.live.connect(
                         model=LIVE_API_MODEL,
                         config=config
                     ) as session:
-                        retry_count = 0  # 接続成功でリセット
 
-                        # 初回接続: ダミーメッセージで初期あいさつを発火
-                        self._is_initial_greeting_phase = True
-                        trigger_msgs = self.INITIAL_GREETING_TRIGGERS
-                        mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
-                        dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
+                        if self.session_count == 1:
+                            # 初回接続: ダミーメッセージで初期あいさつを発火
+                            self._is_initial_greeting_phase = True
+                            trigger_msgs = self.INITIAL_GREETING_TRIGGERS
+                            mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])
+                            dummy_text = mode_msgs.get(self.language, mode_msgs['ja'])
 
-                        await session.send_client_content(
-                            turns=types.Content(
-                                role="user",
-                                parts=[types.Part(text=dummy_text)]
-                            ),
-                            turn_complete=True
-                        )
-                        logger.info(f"[LiveAPI] 初期あいさつトリガー送信: '{dummy_text}'")
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text=dummy_text)]
+                                ),
+                                turn_complete=True
+                            )
+                            logger.info(f"[LiveAPI] 初期あいさつトリガー送信: '{dummy_text}'")
+                        else:
+                            # 再接続時
+                            self._is_initial_greeting_phase = False
+                            self.socketio.emit('live_reconnecting', {},
+                                               room=self.client_sid)
+                            await session.send_client_content(
+                                turns=types.Content(
+                                    role="user",
+                                    parts=[types.Part(text="続きをお願いします")]
+                                ),
+                                turn_complete=True
+                            )
+                            logger.info("[LiveAPI] 再接続通知送信")
+                            self.socketio.emit('live_reconnected', {},
+                                               room=self.client_sid)
 
                         await self._session_loop(session)
-                        break  # 正常終了
+
+                        if not self.needs_reconnect:
+                            break
 
                 except Exception as e:
                     error_msg = str(e).lower()
                     if any(kw in error_msg for kw in
                            ["1011", "internal error", "disconnected",
                             "closed", "websocket"]):
-                        retry_count += 1
-                        wait_sec = min(3 * retry_count, 10)
-                        logger.warning(f"[LiveAPI] 接続エラー({retry_count}/{max_retries})、{wait_sec}秒後に再接続: {e}")
-                        await asyncio.sleep(wait_sec)
+                        logger.warning(f"[LiveAPI] 接続エラー、3秒後に再接続: {e}")
+                        await asyncio.sleep(3)
+                        self.needs_reconnect = True
                         continue
                     else:
+                        # 致命的エラー: ブラウザに通知してREST APIフォールバック
                         logger.error(f"[LiveAPI] 致命的エラー: {e}")
                         self.socketio.emit('live_fallback', {
                             'reason': str(e)
                         }, room=self.client_sid)
                         break
-
-            if retry_count > max_retries:
-                logger.error("[LiveAPI] 最大再接続回数超過")
-                self.socketio.emit('live_fallback', {
-                    'reason': 'Maximum reconnection attempts exceeded'
-                }, room=self.client_sid)
 
         except asyncio.CancelledError:
             pass
@@ -369,37 +400,45 @@ class LiveAPISession:
 
     async def _session_loop(self, session):
         """
-        セッション内ループ: 送信・受信タスクを並行実行
-        Q9: 全二重 - AIが話している間もユーザー音声を送信し続ける
+        セッション内ループ
+        仕様書 セクション7.1: 2つのタスクを並行実行
         """
         async def send_audio():
-            """ブラウザからの音声をLiveAPIに転送（常時送信）"""
-            while self.is_running:
+            """ブラウザからの音声をLiveAPIに転送"""
+            while not self.needs_reconnect and self.is_running:
                 try:
                     audio_data = await asyncio.wait_for(
                         self.audio_queue_to_gemini.get(),
                         timeout=0.1
                     )
                     await session.send_realtime_input(
-                        audio=types.Blob(data=audio_data, mime_type="audio/pcm")
+                        audio={"data": audio_data, "mime_type": "audio/pcm"}
                     )
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    if not self.is_running:
+                    if self.needs_reconnect or not self.is_running:
                         return
                     logger.error(f"[LiveAPI] 送信エラー: {e}")
-                    raise
+                    self.needs_reconnect = True
+                    return
 
         async def receive():
             """LiveAPIからの応答を受信してブラウザに転送"""
             try:
                 await self._receive_and_forward(session)
             except Exception as e:
-                if not self.is_running:
+                if self.needs_reconnect or not self.is_running:
                     return
-                logger.error(f"[LiveAPI] 受信エラー: {e}")
-                raise
+                error_msg = str(e).lower()
+                if any(kw in error_msg for kw in
+                       ["1011", "1008", "internal error",
+                        "closed", "deadline", "policy"]):
+                    logger.warning(f"[LiveAPI] 受信エラー（再接続）: {e}")
+                    self.needs_reconnect = True
+                else:
+                    logger.error(f"[LiveAPI] 受信致命エラー: {e}")
+                    raise
 
         # キューをクリア
         while not self.audio_queue_to_gemini.empty():
@@ -408,22 +447,29 @@ class LiveAPISession:
             except asyncio.QueueEmpty:
                 break
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(send_audio())
-            tg.create_task(receive())
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(send_audio())
+                tg.create_task(receive())
+        except* Exception as eg:
+            if not self.needs_reconnect:
+                for e in eg.exceptions:
+                    error_msg = str(e).lower()
+                    if any(kw in error_msg for kw in
+                           ["1011", "internal error", "closed", "websocket"]):
+                        self.needs_reconnect = True
+                    else:
+                        logger.error(f"[LiveAPI] タスクエラー: {e}")
 
     async def _receive_and_forward(self, session):
         """
         LiveAPIレスポンスを受信してSocket.IOでブラウザに転送
-
-        Q6: turn_complete と interrupted は排他的
-        - turn_complete: AIが最後まで発話した場合
-        - interrupted: ユーザー割り込みでAIが生成停止した場合
+        仕様書 セクション7.3 の receive_audio() を移植
         """
-        while self.is_running:
+        while not self.needs_reconnect and self.is_running:
             turn = session.receive()
             async for response in turn:
-                if not self.is_running:
+                if self.needs_reconnect or not self.is_running:
                     return
 
                 # 1. tool_call（現在は無効化だが将来用）
@@ -433,28 +479,26 @@ class LiveAPISession:
                 if response.server_content:
                     sc = response.server_content
 
-                    # 2. ターン完了（Q6: interruptedが発生した場合はturn_completeにならない）
+                    # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
 
-                        # 初期あいさつフェーズ終了
+                        # 初期あいさつフェーズ終了（仕様書02 セクション4.5.5）
                         if self._is_initial_greeting_phase:
                             self._is_initial_greeting_phase = False
 
-                    # 3. 割り込み検知（Q6: turn_completeとは排他的）
+                    # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
-                        logger.info("[LiveAPI] ユーザー割り込み検知")
-                        # 割り込まれたAI発話はクリア
                         self.ai_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
                                            room=self.client_sid)
                         continue
 
                     # 4. 入力トランスクリプション
-                    #    Q4: VAD区切り or ターン完了時に一括で届く
                     #    初期あいさつフェーズのinput_transcriptionは転送しない
+                    #    （仕様書02 セクション4.5.5）
                     if (hasattr(sc, 'input_transcription')
                             and sc.input_transcription):
                         text = sc.input_transcription.text
@@ -465,7 +509,6 @@ class LiveAPISession:
                                                room=self.client_sid)
 
                     # 5. 出力トランスクリプション
-                    #    Q5: 音声とほぼ同時にストリーミングで小刻みに届く
                     if (hasattr(sc, 'output_transcription')
                             and sc.output_transcription):
                         text = sc.output_transcription.text
@@ -475,7 +518,7 @@ class LiveAPISession:
                                                {'text': text},
                                                room=self.client_sid)
 
-                    # 6. 音声データ（Q3: 24kHz/16bit/LE/Mono）
+                    # 6. 音声データ
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
                             if (hasattr(part, 'inline_data')
@@ -491,9 +534,7 @@ class LiveAPISession:
     def _process_turn_complete(self):
         """
         ターン完了時の処理
-
-        Q7: sliding_window が自動でコンテキスト管理するため、
-        手動の文字数カウント・再接続判定は不要。
+        stt_stream.py:600-644 から移植
         """
         user_text = ""
         if self.user_transcript_buffer.strip():
@@ -507,8 +548,9 @@ class LiveAPISession:
             logger.info(f"[LiveAPI] AI: {ai_text}")
             self._add_to_history("ai", ai_text)
 
-            # ショップ検索トリガー検知
+            # ショップ検索トリガー検知（仕様書02 セクション5.2-5.4）
             if should_trigger_shop_search(ai_text):
+                # ユーザーの要望を会話履歴全体から構築
                 user_request = self._build_search_request(user_text)
                 logger.info(f"[LiveAPI] ショップ検索トリガー検知: '{ai_text}' → ユーザー要望: '{user_request}'")
                 self.socketio.emit('shop_search_trigger', {
@@ -517,8 +559,30 @@ class LiveAPISession:
                     'language': self.language,
                     'mode': self.mode
                 }, room=self.client_sid)
+            else:
+                logger.debug(f"[LiveAPI] トリガー未検知: '{ai_text[:50]}'")
+
+            # 発言が途中で切れているかチェック
+            is_incomplete = self._is_speech_incomplete(ai_text)
+
+            # 文字数をカウント
+            char_count = len(ai_text)
+            self.ai_char_count += char_count
+            remaining = MAX_AI_CHARS_BEFORE_RECONNECT - self.ai_char_count
+            logger.info(f"[LiveAPI] 累積: {self.ai_char_count}文字 / 残り: {remaining}文字")
 
             self.ai_transcript_buffer = ""
+
+            # 再接続判定
+            if is_incomplete:
+                logger.info("[LiveAPI] 発言途切れのため再接続")
+                self.needs_reconnect = True
+            elif char_count >= LONG_SPEECH_THRESHOLD:
+                logger.info(f"[LiveAPI] 長い発話({char_count}文字)のため再接続")
+                self.needs_reconnect = True
+            elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
+                logger.info("[LiveAPI] 累積制限到達のため再接続")
+                self.needs_reconnect = True
 
     def _build_search_request(self, current_user_text: str) -> str:
         """会話履歴からショップ検索用のリクエストテキストを構築"""
@@ -549,9 +613,58 @@ class LiveAPISession:
                 return h['text']
         return ""
 
+    def _is_speech_incomplete(self, text: str) -> bool:
+        """
+        発言が途中で切れているかチェック
+        stt_stream.py:501-529 から移植
+        """
+        if not text:
+            return False
+
+        text = text.strip()
+
+        normal_endings = ['。', '？', '?', '！', '!', 'ます', 'です',
+                          'ね', 'よ', 'した', 'ください']
+        for ending in normal_endings:
+            if text.endswith(ending):
+                return False
+
+        incomplete_patterns = ['、', 'の', 'を', 'が', 'は', 'に', 'で', 'と', 'も', 'や']
+        for pattern in incomplete_patterns:
+            if text.endswith(pattern):
+                return True
+
+        return False
+
     def _add_to_history(self, role: str, text: str):
         """会話履歴に追加"""
         self.conversation_history.append({"role": role, "text": text})
         if len(self.conversation_history) > 20:
             self.conversation_history = self.conversation_history[-20:]
 
+    def _get_context_summary(self) -> str:
+        """会話履歴の要約を取得"""
+        if not self.conversation_history:
+            return ""
+
+        recent = self.conversation_history[-10:]
+        summary_parts = []
+
+        for h in recent:
+            role = h['role']
+            text = h['text'][:150]
+            summary_parts.append(f"{role}: {text}")
+
+        summary = "\n".join(summary_parts)
+
+        # 最後のAI発言が質問なら強調
+        last_ai = None
+        for h in reversed(self.conversation_history):
+            if h['role'] == 'ai':
+                last_ai = h['text']
+                break
+
+        if last_ai and ('?' in last_ai or '？' in last_ai):
+            summary += f"\n\n【直前の質問（回答を待っています）】\n{last_ai[:200]}"
+
+        return summary
