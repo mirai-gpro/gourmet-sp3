@@ -361,42 +361,18 @@ export class CoreController {
       });
       const data = await res.json();
       this.sessionId = data.session_id;
-      
-      this.addMessage('assistant', this.t('initialGreeting'), null, true);
-      
-      const ackTexts = [
-        this.t('ackConfirm'), this.t('ackSearch'), this.t('ackUnderstood'), 
-        this.t('ackYes'), this.t('ttsIntro')
-      ];
-      const langConfig = this.LANGUAGE_CODE_MAP[this.currentLanguage];
-      
-      const ackPromises = ackTexts.map(async (text) => {
-        try {
-          const ackResponse = await fetch(`${this.apiBase}/api/tts/synthesize`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              text: text, language_code: langConfig.tts, voice_name: langConfig.voice 
-            })
-          });
-          const ackData = await ackResponse.json();
-          if (ackData.success && ackData.audio) {
-            this.preGeneratedAcks.set(text, ackData.audio);
-          }
-        } catch (_e) { }
-      });
 
-      await Promise.all([
-        this.speakTextGCP(this.t('initialGreeting')), 
-        ...ackPromises
-      ]);
-      
+      // UIを有効化
       this.els.userInput.disabled = false;
       this.els.sendBtn.disabled = false;
       this.els.micBtn.disabled = false;
       this.els.speakerBtn.disabled = false;
       this.els.speakerBtn.classList.remove('disabled');
       this.els.reservationBtn.classList.remove('visible');
+
+      // ★ LiveAPIで初期挨拶を開始
+      console.log('[Core] LiveAPIで初期挨拶を開始');
+      await this.startLiveMode();
 
     } catch (e) {
       console.error('[Session] Initialization error:', e);
