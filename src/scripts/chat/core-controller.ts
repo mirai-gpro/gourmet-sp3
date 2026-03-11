@@ -276,7 +276,6 @@ export class CoreController {
 
     this.socket.on('live_audio', (data: any) => {
       if (!this.isLiveMode) return;
-      this.liveAudioManager.onAiResponseStarted();
       this.liveAudioManager.playPcmAudio(data.data);
     });
 
@@ -312,7 +311,6 @@ export class CoreController {
     this.socket.on('turn_complete', () => {
       if (!this.isLiveMode) return;
       console.log('[LiveAPI] turn_complete');
-      this.liveAudioManager.onAiResponseEnded();
 
       // ユーザー発話をチャット欄に確定表示
       if (this.userTranscriptBuffer.trim()) {
@@ -329,25 +327,22 @@ export class CoreController {
       this.aiTranscriptBuffer = '';
     });
 
+    // Q6: interrupted と turn_complete は排他的
+    // interrupted時はturn_completeが来ないため、ユーザー発話の確定処理をここで行う
     this.socket.on('interrupted', () => {
       if (!this.isLiveMode) return;
-      console.log('[LiveAPI] interrupted');
+      console.log('[LiveAPI] interrupted（ユーザー割り込み）');
       this.liveAudioManager.clearPlaybackQueue();
-      this.liveAudioManager.onAiResponseEnded();
       this.aiTranscriptBuffer = '';
-      // ストリーミング中のメッセージを削除
+      // ストリーミング中のAIメッセージを削除（割り込まれたため不完全）
       const streaming = this.els.chatArea.querySelector('.message.assistant.live-streaming');
       if (streaming) streaming.remove();
-    });
-
-    this.socket.on('live_reconnecting', () => {
-      if (!this.isLiveMode) return;
-      console.log('[LiveAPI] 再接続中...');
-    });
-
-    this.socket.on('live_reconnected', () => {
-      if (!this.isLiveMode) return;
-      console.log('[LiveAPI] 再接続完了');
+      // ユーザー発話があれば確定表示（turn_completeが来ないため）
+      if (this.userTranscriptBuffer.trim()) {
+        this.addMessage('user', this.userTranscriptBuffer.trim());
+      }
+      this.userTranscriptBuffer = '';
+      this.els.userInput.value = '';
     });
 
     this.socket.on('live_fallback', (data: any) => {
@@ -618,7 +613,6 @@ export class CoreController {
     this.els.micBtn.classList.remove('recording');
     this.liveAudioManager.stopStreaming();
     this.liveAudioManager.clearPlaybackQueue();
-    this.liveAudioManager.onAiResponseEnded();
     this.userTranscriptBuffer = '';
     this.aiTranscriptBuffer = '';
     console.log('[LiveAPI] セッション終了');
