@@ -515,6 +515,10 @@ export class CoreController {
       // LiveAudioManager初期化（マイク取得 + AudioWorklet設定）
       await this.liveAudioManager.initialize(this.socket);
 
+      // LiveAPI開始 = ユーザーがマイクを許可済み → オーディオ再生もアンロック
+      // （ショップ検索結果のGCP TTS読み上げに必要）
+      this.enableAudioPlayback();
+
       // サーバーにLiveAPIセッション開始を通知
       this.socket.emit('live_start', {
         session_id: this.sessionId,
