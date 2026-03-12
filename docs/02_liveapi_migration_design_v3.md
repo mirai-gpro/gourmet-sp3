@@ -530,18 +530,22 @@ v2のセクション7.2をそのまま維持。
 | 項目 | v2 | v3.2（テストフェーズ） |
 |---|---|---|
 | バックエンド: `live_fallback` イベント | 致命的エラー時に emit | **emit しない** |
-| フロントエンド: `switchToRestApiMode()` | `live_fallback` 受信で発動 | **削除（呼び出し箇所ごと削除）** |
-| フロントエンド: テキスト入力時の切替 | LiveAPI中にテキスト入力→REST切替 | **削除** |
+| フロントエンド: `switchToRestApiMode()`（フォールバック） | `live_fallback` 受信で発動 | **削除** |
+| フロントエンド: `toggleRecording()`（マイクボタン） | LiveAPI中にマイクボタン押下→`switchToRestApiMode()` | **`terminateLiveSession()` を直接呼び出しに変更** |
 | エラー時の挙動 | REST APIモードに切り替え | **エラーログを出して終了（ユーザーが手動リロード）** |
 
 **削除対象（core-controller.ts）:**
 - `live_fallback` イベントハンドラ内の `switchToRestApiMode()` 呼び出し
-- テキスト入力時の `switchToRestApiMode()` 呼び出し
 - `switchToRestApiMode()` メソッド自体（テストフェーズでは不要）
+
+**変更対象（core-controller.ts）:**
+- `toggleRecording()` 内の `switchToRestApiMode()` → `terminateLiveSession()` に置換
+  - マイクボタンによるLiveAPI停止はフォールバックではなくユーザー操作による意図的な停止であるため、削除ではなく `terminateLiveSession()` の直接呼び出しに変更する
 
 **理由:**
 テストフェーズではLiveAPIの挙動を正確に検証する必要がある。
 フォールバックが発動すると、LiveAPI側の問題が隠蔽され、デバッグが困難になる。
+ただし、マイクボタンによるLiveAPI停止はユーザーの意図的な操作であり、フォールバックとは異なるため維持する。
 
 ---
 
@@ -637,7 +641,7 @@ LiveAPI v3で同じ原理を再現:
 | 8 | 検索後に「別のエリアで」と言う | AIが他の条件を維持したまま新エリアで対応する |
 | 9 | 再接続時のsend_client_content再送 | 直近10ターンが正しく再送される（ログで確認） |
 | 10 | 任意のエリア名（リストにないもの含む） | Geminiが会話履歴から自然に理解する |
-| 11 | フォールバックが発動しないこと | switchToRestApiModeが呼ばれない。コンソールに「REST APIモードに切り替え」が出ない |
+| 11 | フォールバックが発動しないこと | `live_fallback` イベントが発火しない。マイクボタン以外で `terminateLiveSession()` が呼ばれない |
 
 ### 11.4 Phase 3 テスト項目（v2と同じ）
 
@@ -665,5 +669,6 @@ LiveAPI移行で「何がどう変わったか」の対応表。
 
 *以上が LiveAPI 移植設計書 v3.2。*
 *v3.1→v3.2の変更: 重複セクション3.2削除、ショップ検索フロー（_shop_search_pending→run()ペンディングチェック）を明記、フォールバック（switchToRestApiMode）をテストフェーズで無効化。*
+*v3.2a修正: セクション8の削除対象を実コードと整合。存在しない「テキスト入力時」呼び出しを削除し、toggleRecording()（マイクボタン）のswitchToRestApiMode()→terminateLiveSession()直接呼び出しへの変更を明記。テスト項目11も更新。*
 *v3の主な方針: キーワード抽出（short_term_memory / hearing_step）を廃止し、REST版と同じ「プロンプト + 会話履歴送信」方式に統一。*
 *実装時は本設計書、`01_stt_stream_detailed_spec.md`、`03_prompt_modification_spec.md` を常に参照すること。*
