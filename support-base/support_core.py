@@ -627,7 +627,7 @@ class SupportAssistant:
                 self.session.save_current_shops(parsed_shops)
 
             summary = None
-            if conversation_stage in ('conversation', 'shop_search'):
+            if conversation_stage == 'conversation':
                 if parsed_shops:
                     summary_messages = {
                         'ja': lambda count: f"{count}軒のお店を提案しました。",

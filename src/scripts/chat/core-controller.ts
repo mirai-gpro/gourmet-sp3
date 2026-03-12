@@ -555,7 +555,7 @@ export class CoreController {
         body: JSON.stringify({
           session_id: this.sessionId,
           message: message,
-          stage: 'shop_search',
+          stage: this.currentStage,
           language: this.currentLanguage,
           mode: this.currentMode
         })
@@ -601,13 +601,8 @@ export class CoreController {
       }
 
       console.log('[LiveAPI→REST] ショップ検索完了:', result.shops?.length || 0, '件');
-
-      // ショップ検索完了後、LiveAPIを再開（TTS完了を待ってから）
-      this.restartLiveAfterSearch();
     } catch (error) {
       console.error('[LiveAPI→REST] ショップ検索エラー:', error);
-      // エラー時もLiveAPIを再開
-      this.restartLiveAfterSearch();
     } finally {
       this.isProcessing = false;
       this.resetInputState();
@@ -627,26 +622,6 @@ export class CoreController {
     this.userTranscriptBuffer = '';
     this.aiTranscriptBuffer = '';
     console.log('[LiveAPI] セッション終了');
-  }
-
-  /**
-   * ショップ検索完了後にLiveAPIを再開
-   * TTS読み上げ中の場合は完了を待ってから再開
-   */
-  protected restartLiveAfterSearch(): void {
-    const waitAndRestart = () => {
-      if (this.isAISpeaking) {
-        // TTS読み上げ中なら500ms後にリトライ
-        setTimeout(waitAndRestart, 500);
-        return;
-      }
-      console.log('[LiveAPI] ショップ検索後、LiveAPI再開');
-      this.startLiveMode().catch(err => {
-        console.error('[LiveAPI] ショップ検索後の再開エラー:', err);
-      });
-    };
-    // 少し待ってから再開（UIの更新を待つ）
-    setTimeout(waitAndRestart, 1000);
   }
 
   protected stopStreamingSTT() {

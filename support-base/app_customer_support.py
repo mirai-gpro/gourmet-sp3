@@ -266,39 +266,6 @@ def chat():
         session.update_mode(mode)
 
         # 2. ユーザー入力を記録
-        # v3: LiveAPI会話履歴をSupportSessionに注入
-        # LiveAPIモードでの会話はSupportSessionに記録されないため、
-        # ショップ検索でREST APIが呼ばれた時に会話文脈をLLMに渡す必要がある
-        if session_id in _live_session_state_store:
-            saved_state = _live_session_state_store[session_id]
-            live_history = saved_state.get('conversation_history', [])
-            if live_history:
-                existing_msgs = session.get_data().get('messages', [])
-                # 既にLiveAPI履歴を注入済みでない場合のみ（重複防止）
-                chat_msgs = [m for m in existing_msgs if m.get('type') == 'chat']
-                if len(chat_msgs) <= 2:
-                    for h in live_history:
-                        role = 'user' if h['role'] == 'user' else 'model'
-                        session.add_message(role, h['text'], 'chat')
-                    logger.info(f"[Chat] LiveAPI会話履歴をSupportSessionに注入: {len(live_history)}件")
-
-        # v3: LiveAPIからのショップ検索リクエストの場合、
-        # 検索指示を明示的に追加（LLMが追加質問せずshopsを返すようにする）
-        if stage == 'shop_search':
-            search_directive = (
-                "\n\n"
-                "【重要指示：ショップ検索モード】\n"
-                "これはショップ検索リクエストです。上記の条件でお店を検索して提案してください。\n"
-                "追加の質問は一切しないでください。今ある条件だけでお店を提案してください。\n"
-                "必ず以下のJSON形式のみで返答してください。マークダウンやプレーンテキストは禁止です。\n"
-                '{"message": "お客様への返答メッセージ", "shops": [{"name": "店名", "area": "エリア", '
-                '"genre": "ジャンル", "budget": "予算帯", "description": "お店の説明", '
-                '"specialty": "おすすめポイント", "atmosphere": "雰囲気", "features": "特徴"}]}\n'
-                "shopsは5件提案してください。"
-            )
-            user_message = user_message + search_directive
-            logger.info(f"[Chat] ショップ検索モード: 検索指示を追加")
-
         session.add_message('user', user_message, 'chat')
 
         # 3. 知能生成 (Assistant作成)
@@ -775,8 +742,6 @@ def health_check():
 # ========================================
 
 active_live_sessions = {}  # {client_sid: LiveAPISession}
-# v3: セッション間で短期記憶・会話履歴を永続化（live_stop/live_startのサイクルで消えないように）
-_live_session_state_store = {}  # {session_id: {'short_term_memory': dict, 'hearing_step': int, 'conversation_history': list}}
 
 @socketio.on('live_start')
 def handle_live_start(data):
@@ -786,15 +751,9 @@ def handle_live_start(data):
     mode = data.get('mode', 'chat')
     language = data.get('language', 'ja')
 
-    # 既存のLiveAPIセッションがあれば停止（v3: 短期記憶を保存してから）
+    # 既存のLiveAPIセッションがあれば停止
     if client_sid in active_live_sessions:
         old_session = active_live_sessions[client_sid]
-        if old_session.session_id and old_session.mode == 'concierge':
-            _live_session_state_store[old_session.session_id] = {
-                'short_term_memory': dict(old_session.short_term_memory),
-                'hearing_step': old_session.hearing_step,
-                'conversation_history': list(old_session.conversation_history),
-            }
         old_session.stop()
         del active_live_sessions[client_sid]
 
@@ -828,18 +787,6 @@ def handle_live_start(data):
         socketio=socketio,
         client_sid=client_sid
     )
-    # v3: 保存された短期記憶・会話履歴を復元
-    if session_id and session_id in _live_session_state_store:
-        saved = _live_session_state_store[session_id]
-        live_session.short_term_memory = saved['short_term_memory']
-        live_session.hearing_step = saved['hearing_step']
-        live_session.conversation_history = saved['conversation_history']
-        # session_count=1にして、run()で+1→2になり再接続フロー（初期挨拶スキップ）に入る
-        live_session.session_count = 1
-        logger.info(f"[LiveAPI] 短期記憶を復元: session={session_id}, "
-                    f"step={saved['hearing_step']}, "
-                    f"history={len(saved['conversation_history'])}ターン")
-
     active_live_sessions[client_sid] = live_session
 
     # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
@@ -889,16 +836,6 @@ def handle_live_stop():
     client_sid = request.sid
     if client_sid in active_live_sessions:
         live_session = active_live_sessions[client_sid]
-        # v3: 短期記憶・会話履歴をsession_idで永続化
-        if live_session.session_id and live_session.mode == 'concierge':
-            _live_session_state_store[live_session.session_id] = {
-                'short_term_memory': dict(live_session.short_term_memory),
-                'hearing_step': live_session.hearing_step,
-                'conversation_history': list(live_session.conversation_history),
-            }
-            logger.info(f"[LiveAPI] 短期記憶を保存: session={live_session.session_id}, "
-                        f"step={live_session.hearing_step}, "
-                        f"conditions={live_session._get_confirmed_conditions()}")
         live_session.stop()
         del active_live_sessions[client_sid]
     emit('live_stopped', {'status': 'disconnected'})
