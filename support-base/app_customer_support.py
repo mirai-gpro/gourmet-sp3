@@ -751,11 +751,9 @@ def handle_live_start(data):
     mode = data.get('mode', 'chat')
     language = data.get('language', 'ja')
 
-    # 既存のLiveAPIセッションがあれば停止（会話履歴を引き継ぐ）
-    previous_history = []
+    # 既存のLiveAPIセッションがあれば停止
     if client_sid in active_live_sessions:
         old_session = active_live_sessions[client_sid]
-        previous_history = old_session.conversation_history
         old_session.stop()
         del active_live_sessions[client_sid]
 
@@ -801,7 +799,7 @@ def handle_live_start(data):
             logger.error(f"[ShopSearch] コールバックエラー: {e}", exc_info=True)
             return None
 
-    # LiveAPIセッション作成（既存の会話履歴を引き継ぐ）
+    # LiveAPIセッション作成
     live_session = LiveAPISession(
         session_id=session_id,
         mode=mode,
@@ -809,8 +807,7 @@ def handle_live_start(data):
         system_prompt=system_prompt,
         socketio=socketio,
         client_sid=client_sid,
-        shop_search_callback=shop_search_callback,
-        initial_history=previous_history if previous_history else None
+        shop_search_callback=shop_search_callback
     )
     active_live_sessions[client_sid] = live_session
 

@@ -257,7 +257,7 @@ class LiveAPISession:
 
     def __init__(self, session_id: str, mode: str, language: str,
                  system_prompt: str, socketio, client_sid: str,
-                 shop_search_callback=None, initial_history=None):
+                 shop_search_callback=None):
         self.session_id = session_id
         self.mode = mode
         self.language = language
@@ -277,7 +277,7 @@ class LiveAPISession:
         # 状態管理（stt_stream.py:387-394 から転記）
         self.user_transcript_buffer = ""
         self.ai_transcript_buffer = ""
-        self.conversation_history = initial_history or []
+        self.conversation_history = []
         self.ai_char_count = 0
         self.needs_reconnect = False
         self.session_count = 0
@@ -389,22 +389,7 @@ class LiveAPISession:
                         config=config
                     ) as session:
 
-                        if self.session_count == 1 and self.conversation_history:
-                            # 初回接続だが既存履歴あり（セッション再開）
-                            # 会話履歴を送信して続行
-                            self._is_initial_greeting_phase = False
-                            await self._send_history_on_reconnect(session)
-
-                            await session.send_client_content(
-                                turns=types.Content(
-                                    role="user",
-                                    parts=[types.Part(text="続きをお願いします")]
-                                ),
-                                turn_complete=True
-                            )
-                            logger.info(f"[LiveAPI] セッション再開: 既存履歴 {len(self.conversation_history)} ターン再送")
-
-                        elif self.session_count == 1:
+                        if self.session_count == 1:
                             # 初回接続: ダミーメッセージで初期あいさつを発火
                             self._is_initial_greeting_phase = True
                             trigger_msgs = self.INITIAL_GREETING_TRIGGERS
