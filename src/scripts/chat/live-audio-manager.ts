@@ -68,6 +68,9 @@ export class LiveAudioManager {
             this.audioContext = new AudioContextClass({ sampleRate: 48000 });
         }
 
+        // ソフトリロード時の古い再生キューをクリア
+        this.clearPlaybackQueue();
+
         console.log('[LiveAudioManager] 再生初期化完了');
     }
 
@@ -215,8 +218,20 @@ export class LiveAudioManager {
         this._processPlaybackQueue();
     }
 
+    // AudioContext再開後にキューを再生（ユーザージェスチャー後に呼ぶ）
+    resumePlayback(): void {
+        if (this.audioContext && this.audioContext.state === 'suspended') {
+            this.audioContext.resume().then(() => {
+                this._processPlaybackQueue();
+            });
+        }
+    }
+
     private _processPlaybackQueue(): void {
         if (this.isPlaying || this.playbackQueue.length === 0 || !this.audioContext) return;
+
+        // AudioContextがsuspendedなら再生をスキップ（resumePlayback待ち）
+        if (this.audioContext.state === 'suspended') return;
 
         this.isPlaying = true;
         const buffer = this.playbackQueue.shift()!;

@@ -151,8 +151,7 @@ export class CoreController {
     this.isProcessing = false;
     this.isAISpeaking = false;
     this.isFromVoiceInput = false;
-    // ★ LiveAPIセッションをリセット
-    this.terminateLiveSession();
+    // ★ LiveAPIセッションリセットは stopAllActivities() 内で実行済み
 
     await new Promise(resolve => setTimeout(resolve, 300));
     await this.initializeSession();
@@ -1012,6 +1011,8 @@ export class CoreController {
       const clickPrompt = this.container.querySelector('.click-prompt');
       if (clickPrompt) clickPrompt.remove();
       this.unlockAudioParams();
+      // LiveAPI再生キューのAudioContextを再開（ハードリロード後のsuspended対策）
+      this.liveAudioManager.resumePlayback();
     }
   }
 
