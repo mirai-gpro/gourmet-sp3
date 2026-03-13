@@ -77,10 +77,12 @@ export class ConciergeController extends CoreController {
       this.els.speakerBtn.classList.remove('disabled');
       this.els.reservationBtn.classList.remove('visible');
 
-      // 3. ★ LiveAPIで初期挨拶を開始
-      //    REST APIの greetingText + speakTextGCP() は全て削除
-      //    preGeneratedAcks のTTS事前生成も削除
-      await this.startLiveMode();
+      // 3. ★ LiveAPIセッション開始（マイクなし）
+      //    ソフトリロード時: AudioContext生存 → 即接続 + 挨拶再生
+      //    初回ロード時: スプラッシュtapで起動するため、ここではスキップ
+      if (this.liveAudioManager.isPlaybackReady()) {
+        await this.startLiveSession();
+      }
 
     } catch (e) {
       console.error('[Session] Initialization error:', e);

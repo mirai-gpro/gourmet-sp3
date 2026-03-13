@@ -57,19 +57,33 @@ export class LiveAudioManager {
     private nextPlayTime: number = 0;
 
     // ========================================
-    // セッション開始時に1度だけ呼ぶ
+    // Phase 1: 再生用AudioContextのみ初期化（スプラッシュtap時）
+    // getUserMediaは呼ばない → iOSでもユーザージェスチャー不要
     // ========================================
-    async initialize(socket: any): Promise<void> {
+    async initPlayback(socket: any): Promise<void> {
         if (this.audioContext) return; // 既に初期化済み
 
         this.socket = socket;
 
-        // 1. AudioContext (1つだけ) - 48kHzでマイク入力
         // @ts-ignore
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         this.audioContext = new AudioContextClass({ sampleRate: 48000 });
 
-        // 2. getUserMedia (1回だけ)
+        console.log('[LiveAudioManager] 再生用AudioContext初期化完了');
+    }
+
+    // ========================================
+    // Phase 2: マイク初期化（マイクボタンclick時）
+    // getUserMediaはユーザージェスチャー内で呼ぶ → iOS対応
+    // ========================================
+    async initMicrophone(): Promise<void> {
+        if (this.mediaStream) return; // 既にマイク取得済み
+        if (!this.audioContext) {
+            console.warn('[LiveAudioManager] AudioContext未初期化、initMicrophone中止');
+            return;
+        }
+
+        // 1. getUserMedia（ユーザージェスチャー内で呼ばれる前提）
         this.mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 echoCancellation: true,
@@ -79,7 +93,7 @@ export class LiveAudioManager {
             }
         });
 
-        // 3. AudioWorklet登録 (1回だけ)
+        // 2. AudioWorklet登録
         // 48kHz → 16kHz ダウンサンプリング + Int16変換
         const downsampleRatio = 48000 / 16000; // = 3
         const audioProcessorCode = `
@@ -129,12 +143,12 @@ export class LiveAudioManager {
         await this.audioContext.audioWorklet.addModule(processorUrl);
         URL.revokeObjectURL(processorUrl);
 
-        // 4. Node作成・接続
+        // 3. Node作成・接続
         this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
         this.audioWorkletNode = new AudioWorkletNode(this.audioContext, 'live-audio-processor');
         this.sourceNode.connect(this.audioWorkletNode);
 
-        // 5. フラグによる送信制御
+        // 4. フラグによる送信制御
         this.audioWorkletNode.port.onmessage = (e) => {
             if (!this.isStreaming) return;
             if (this.isAiSpeaking) return; // 半二重: AI応答中は送信しない
@@ -144,7 +158,24 @@ export class LiveAudioManager {
             this.socket.emit('live_audio_in', { data: base64 });
         };
 
-        console.log('[LiveAudioManager] 初期化完了');
+        console.log('[LiveAudioManager] マイク初期化完了');
+    }
+
+    // ========================================
+    // 再生用AudioContextが初期化済みかどうか
+    // ========================================
+    isPlaybackReady(): boolean {
+        return this.audioContext !== null;
+    }
+
+    // ========================================
+    // AudioContextをresume（ユーザージェスチャー内で呼ぶ）
+    // ========================================
+    async resumeContext(): Promise<void> {
+        if (this.audioContext && this.audioContext.state === 'suspended') {
+            await this.audioContext.resume();
+            console.log('[LiveAudioManager] AudioContext resumed');
+        }
     }
 
     // ========================================
