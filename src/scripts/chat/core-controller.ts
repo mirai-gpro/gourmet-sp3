@@ -356,6 +356,12 @@ export class CoreController {
       console.log('[LiveAPI] 再接続完了');
     });
 
+    // ★ A2E expressionフレーム受信（フェーズ2: リップシンク）
+    this.socket.on('live_expression', (data: any) => {
+      if (!this.isLiveMode) return;
+      this.liveAudioManager.onExpressionReceived(data);
+    });
+
     this.socket.on('live_stopped', () => {
       console.log('[LiveAPI] live_stopped');
       this.isLiveMode = false;

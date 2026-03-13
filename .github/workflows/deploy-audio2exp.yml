@@ -1,0 +1,37 @@
+name: Deploy audio2exp-service
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'audio2exp-service/**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: audio2exp-service
+          source: audio2exp-service/
+          region: asia-northeast1
+          flags: >-
+            --memory=2Gi
+            --cpu=2
+            --min-instances=1
+            --max-instances=3
+            --timeout=60

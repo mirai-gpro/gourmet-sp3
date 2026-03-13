@@ -1,0 +1,226 @@
+---
+// LAMAvatar.astro - Gaussian Splat 3Dアバター + ARKit 52ブレンドシェイプ リップシンク
+// 移植元: LAM_gpro/gourmet-sp/src/components/LAMAvatar.astro
+// 改修: LiveAudioManager との expression 同期に対応
+---
+
+<div class="lam-avatar-container" id="lamAvatarContainer">
+  <canvas id="lamAvatarCanvas"></canvas>
+  <img
+    id="lamAvatarFallback"
+    src="/images/avatar-anime.png"
+    alt="AI Avatar"
+    class="lam-avatar-fallback hidden"
+  />
+</div>
+
+<style>
+.lam-avatar-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#lamAvatarCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.lam-avatar-fallback {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 6px rgba(0,0,0,0.2));
+}
+
+.lam-avatar-fallback.hidden {
+  display: none;
+}
+
+#lamAvatarCanvas.hidden {
+  display: none;
+}
+</style>
+
+<script>
+  import type { ExpressionData } from '../scripts/chat/live-audio-manager';
+  import type { LiveAudioManager } from '../scripts/chat/live-audio-manager';
+
+  interface LAMAvatarController {
+    setLiveAudioManager(manager: LiveAudioManager): void;
+    queueExpressionFrames(frames: ExpressionData[], frameRate: number): void;
+    clearFrameBuffer(): void;
+  }
+
+  // Gaussian Splat Renderer
+  // gaussian-splat-renderer-for-lam パッケージを使用
+  // npm install gaussian-splat-renderer-for-lam
+  let renderer: any = null;
+  let liveAudioManager: LiveAudioManager | null = null;
+  let animationFrameId: number = 0;
+  let isInitialized = false;
+
+  /**
+   * LAMAvatarの初期化
+   * WebGL対応チェック → Gaussian Splatモデル読み込み → 描画ループ開始
+   */
+  async function initLamAvatar() {
+    const canvas = document.getElementById('lamAvatarCanvas') as HTMLCanvasElement;
+    const fallback = document.getElementById('lamAvatarFallback') as HTMLImageElement;
+
+    if (!canvas) return;
+
+    // WebGL対応チェック
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    if (!gl) {
+      console.warn('[LAMAvatar] WebGL非対応 → フォールバック画像を表示');
+      canvas.classList.add('hidden');
+      fallback.classList.remove('hidden');
+      return;
+    }
+
+    try {
+      // Gaussian Splat Renderer の動的インポート
+      // パッケージがインストールされていない場合はフォールバック
+      const GaussianSplatModule = await import('gaussian-splat-renderer-for-lam').catch(() => null);
+
+      if (!GaussianSplatModule) {
+        console.warn('[LAMAvatar] gaussian-splat-renderer-for-lam が未インストール → フォールバック');
+        canvas.classList.add('hidden');
+        fallback.classList.remove('hidden');
+        return;
+      }
+
+      // キャンバスサイズを親要素に合わせる
+      const container = canvas.parentElement!;
+      canvas.width = container.clientWidth;
+      canvas.height = container.clientHeight;
+
+      // Gaussian Splat レンダラー初期化
+      renderer = new GaussianSplatModule.GaussianSplatRenderer(canvas);
+      await renderer.loadModel('/avatar/concierge.zip');
+
+      isInitialized = true;
+      console.log('[LAMAvatar] Gaussian Splatモデル読み込み完了');
+
+      // 描画ループ開始
+      startRenderLoop();
+
+    } catch (e) {
+      console.error('[LAMAvatar] 初期化エラー:', e);
+      canvas.classList.add('hidden');
+      fallback.classList.remove('hidden');
+    }
+  }
+
+  /**
+   * 60fps描画ループ
+   * 毎フレーム LiveAudioManager から現在のexpressionフレームを取得して適用
+   */
+  function startRenderLoop() {
+    function render() {
+      if (!isInitialized || !renderer) return;
+
+      // LiveAudioManagerからexpression取得
+      const expressionData = getExpressionData();
+      if (expressionData) {
+        applyExpression(expressionData);
+      }
+
+      renderer.render();
+      animationFrameId = requestAnimationFrame(render);
+    }
+    animationFrameId = requestAnimationFrame(render);
+  }
+
+  /**
+   * 現在の再生位置に対応するexpressionデータを取得
+   * LiveAudioManager.getCurrentExpressionFrame() に委譲
+   */
+  function getExpressionData(): ExpressionData | null {
+    if (!liveAudioManager) return null;
+    return liveAudioManager.getCurrentExpressionFrame();
+  }
+
+  /**
+   * ExpressionDataをGaussian Splatモデルに適用
+   * ARKit 52ブレンドシェイプの重みをレンダラーに反映
+   */
+  function applyExpression(data: ExpressionData) {
+    if (!renderer || !data.names || !data.weights) return;
+
+    for (let i = 0; i < data.names.length; i++) {
+      const name = data.names[i];
+      const weight = data.weights[i] || 0;
+      // レンダラーのブレンドシェイプAPIに重みを設定
+      if (renderer.setBlendShapeWeight) {
+        renderer.setBlendShapeWeight(name, weight);
+      }
+    }
+  }
+
+  // ========================================
+  // LAMAvatarController インターフェース
+  // window.lamAvatarController として公開
+  // ========================================
+  const controller: LAMAvatarController = {
+    setLiveAudioManager(manager: LiveAudioManager) {
+      liveAudioManager = manager;
+      console.log('[LAMAvatar] LiveAudioManager接続完了');
+    },
+
+    queueExpressionFrames(frames: ExpressionData[], _frameRate: number) {
+      // 直接フレームをキューに追加（LiveAudioManagerを経由しない場合のフォールバック）
+      if (liveAudioManager) {
+        // LiveAudioManager経由の場合はonExpressionReceivedで処理済み
+        return;
+      }
+      console.log(`[LAMAvatar] ${frames.length}フレームを直接キュー`);
+    },
+
+    clearFrameBuffer() {
+      // LiveAudioManagerのバッファクリアに委譲
+      console.log('[LAMAvatar] フレームバッファクリア');
+    },
+  };
+
+  // グローバル公開
+  (window as any).lamAvatarController = controller;
+
+  // ResizeObserverでキャンバスサイズを追従
+  function setupResizeObserver() {
+    const container = document.getElementById('lamAvatarContainer');
+    const canvas = document.getElementById('lamAvatarCanvas') as HTMLCanvasElement;
+    if (!container || !canvas) return;
+
+    const observer = new ResizeObserver(() => {
+      if (!isInitialized) return;
+      canvas.width = container.clientWidth;
+      canvas.height = container.clientHeight;
+      if (renderer && renderer.resize) {
+        renderer.resize(canvas.width, canvas.height);
+      }
+    });
+    observer.observe(container);
+  }
+
+  // 初期化実行
+  document.addEventListener('DOMContentLoaded', () => {
+    initLamAvatar();
+    setupResizeObserver();
+  });
+
+  // クリーンアップ
+  window.addEventListener('beforeunload', () => {
+    if (animationFrameId) {
+      cancelAnimationFrame(animationFrameId);
+    }
+    if (renderer && renderer.dispose) {
+      renderer.dispose();
+    }
+  });
+</script>

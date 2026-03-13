@@ -13,10 +13,14 @@ import asyncio
 import base64
 import os
 import logging
+import aiohttp
 from google import genai
 from google.genai import types
 
 logger = logging.getLogger(__name__)
+
+# A2E (Audio2Expression) サービスURL
+AUDIO2EXP_SERVICE_URL = os.getenv("AUDIO2EXP_SERVICE_URL", "")
 
 # stt_stream.py から転記（変更禁止）
 LIVE_API_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
@@ -371,6 +375,14 @@ class LiveAPISession:
         self.audio_queue_to_gemini = None
         self.is_running = False
 
+        # ★ A2Eリップシンク用バッファ（文節単位）
+        # ⚠️ 短いチャンクでA2Eに送ると表情データ品質が劣化する（実験実証済み）
+        # output_transcription の句読点検出でフラッシュする
+        self._a2e_audio_buffer = bytearray()
+        self._a2e_transcript_buffer = ""
+        self._a2e_chunk_index = 0
+        self._a2e_http_session: aiohttp.ClientSession | None = None
+
     def _build_config(self, with_context=None):
         """
         Live API接続設定を構築
@@ -532,6 +544,7 @@ class LiveAPISession:
             pass
         finally:
             self.is_running = False
+            await self._close_a2e_session()
             logger.info(f"[LiveAPI] セッション終了: {self.session_id}")
 
     async def _session_loop(self, session):
@@ -632,6 +645,9 @@ class LiveAPISession:
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
                         self.ai_transcript_buffer = ""
+                        # ★ A2E: 割り込み時はバッファを破棄
+                        self._a2e_audio_buffer.clear()
+                        self._a2e_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
                                            room=self.client_sid)
                         continue
@@ -657,6 +673,8 @@ class LiveAPISession:
                             self.socketio.emit('ai_transcript',
                                                {'text': text},
                                                room=self.client_sid)
+                            # ★ A2E: 句読点検出でバッファフラッシュ
+                            self._on_output_transcription(text)
 
                     # 6. 音声データ
                     if sc.model_turn:
@@ -664,12 +682,15 @@ class LiveAPISession:
                             if (hasattr(part, 'inline_data')
                                     and part.inline_data):
                                 if isinstance(part.inline_data.data, bytes):
+                                    audio_bytes = part.inline_data.data
                                     audio_b64 = base64.b64encode(
-                                        part.inline_data.data
+                                        audio_bytes
                                     ).decode('utf-8')
                                     self.socketio.emit('live_audio',
                                                        {'data': audio_b64},
                                                        room=self.client_sid)
+                                    # ★ A2E: バッファに蓄積（送信はしない）
+                                    self._buffer_for_a2e(audio_bytes)
 
     async def _handle_tool_call(self, tool_call, session):
         """
@@ -742,6 +763,10 @@ class LiveAPISession:
         ターン完了時の処理
         stt_stream.py:600-644 から移植
         """
+        # ★ A2Eバッファの残りを強制フラッシュ（ターン完了 = 発話終了）
+        self._flush_a2e_buffer(force=True)
+        self._a2e_chunk_index = 0
+
         user_text = ""
         if self.user_transcript_buffer.strip():
             user_text = self.user_transcript_buffer.strip()
@@ -863,6 +888,10 @@ class LiveAPISession:
 
                 # ターン完了
                 if hasattr(sc, 'turn_complete') and sc.turn_complete:
+                    # ★ A2Eバッファフラッシュ
+                    self._flush_a2e_buffer(force=True)
+                    self._a2e_chunk_index = 0
+
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
                         logger.info(f"[ShopDesc] ショップ{shop_number}: {ai_text}")
@@ -879,6 +908,8 @@ class LiveAPISession:
                         self.socketio.emit('ai_transcript',
                                            {'text': text, 'type': 'shop_description'},
                                            room=self.client_sid)
+                        # ★ A2E: 句読点検出でバッファフラッシュ
+                        self._on_output_transcription(text)
 
                 # 音声データ
                 if sc.model_turn:
@@ -886,12 +917,15 @@ class LiveAPISession:
                         if (hasattr(part, 'inline_data')
                                 and part.inline_data):
                             if isinstance(part.inline_data.data, bytes):
+                                audio_bytes = part.inline_data.data
                                 audio_b64 = base64.b64encode(
-                                    part.inline_data.data
+                                    audio_bytes
                                 ).decode('utf-8')
                                 self.socketio.emit('live_audio',
                                                    {'data': audio_b64},
                                                    room=self.client_sid)
+                                # ★ A2E: バッファに蓄積
+                                self._buffer_for_a2e(audio_bytes)
 
     def _format_shop_for_prompt(self, shop: dict, number: int, total: int) -> str:
         """ショップ情報をプロンプト用にフォーマット"""
@@ -972,6 +1006,96 @@ class LiveAPISession:
             return f"【直前のAIの質問（回答を待っています）】\n{last_ai[:200]}"
 
         return ""
+
+    # ============================================================
+    # A2E (Audio2Expression) バッファリング＆送信メソッド群
+    # ⚠️ 文節単位バッファリング: 短いチャンクでは表情品質が劣化する（実験実証済み）
+    # ============================================================
+
+    def _buffer_for_a2e(self, pcm_bytes: bytes):
+        """PCMチャンクをバッファに追加（送信タイミングは句読点検出に委譲）"""
+        if not AUDIO2EXP_SERVICE_URL:
+            return
+        self._a2e_audio_buffer.extend(pcm_bytes)
+
+    def _on_output_transcription(self, text: str):
+        """output_transcription受信時に句読点を検出してA2Eフラッシュ判定"""
+        if not AUDIO2EXP_SERVICE_URL:
+            return
+        self._a2e_transcript_buffer += text
+        # 句読点検出 → 文節完結と判断してフラッシュ
+        sentence_endings = ['。', '？', '?', '！', '!', '、']
+        if any(self._a2e_transcript_buffer.rstrip().endswith(e) for e in sentence_endings):
+            self._flush_a2e_buffer()
+
+    def _flush_a2e_buffer(self, force: bool = False):
+        """
+        A2Eバッファをフラッシュ（文節単位で送信）
+
+        force=True: ターン完了時の強制フラッシュ（最低長チェックをスキップ）
+        force=False: 通常の句読点フラッシュ（最低0.5秒チェック）
+        """
+        if not AUDIO2EXP_SERVICE_URL or not self._a2e_audio_buffer:
+            return
+
+        # 最低音声長チェック（0.5秒 = 24000サンプル = 48000バイト @ 24kHz 16bit）
+        MIN_BUFFER_BYTES = 48000
+        if not force and len(self._a2e_audio_buffer) < MIN_BUFFER_BYTES:
+            return  # 短すぎる → 次の文節と結合
+
+        buffer_copy = bytes(self._a2e_audio_buffer)
+        self._a2e_audio_buffer.clear()
+        self._a2e_transcript_buffer = ""
+        chunk_index = self._a2e_chunk_index
+        self._a2e_chunk_index += 1
+
+        duration_sec = len(buffer_copy) / (24000 * 2)  # 24kHz 16bit
+        logger.info(f"[A2E] バッファフラッシュ: chunk={chunk_index}, "
+                    f"{duration_sec:.2f}秒, force={force}")
+
+        # 非同期でA2Eに送信（音声再生をブロックしない）
+        asyncio.create_task(self._send_to_a2e(buffer_copy, chunk_index))
+
+    async def _send_to_a2e(self, pcm_bytes: bytes, chunk_index: int):
+        """A2EサービスにPCMを送信し、expressionフレームをブラウザに転送"""
+        try:
+            audio_b64 = base64.b64encode(pcm_bytes).decode('utf-8')
+
+            if not self._a2e_http_session:
+                self._a2e_http_session = aiohttp.ClientSession()
+
+            async with self._a2e_http_session.post(
+                f"{AUDIO2EXP_SERVICE_URL}/api/audio2expression",
+                json={
+                    "audio_base64": audio_b64,
+                    "session_id": self.session_id,
+                    "audio_format": "pcm_24000_16bit_mono",
+                    "is_start": chunk_index == 0,
+                    "is_final": False,
+                },
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    frames = result.get('frames', [])
+                    if frames:
+                        self.socketio.emit('live_expression', {
+                            'chunk_index': chunk_index,
+                            'names': result.get('names', []),
+                            'frames': frames,
+                            'frame_rate': result.get('frame_rate', 30),
+                        }, room=self.client_sid)
+                        logger.debug(f"[A2E] chunk {chunk_index}: {len(frames)}フレーム送信")
+                else:
+                    logger.warning(f"[A2E] HTTPエラー: status={resp.status}")
+        except Exception as e:
+            logger.warning(f"[A2E] 送信エラー: {e}")
+
+    async def _close_a2e_session(self):
+        """A2E用HTTPセッションをクリーンアップ"""
+        if self._a2e_http_session:
+            await self._a2e_http_session.close()
+            self._a2e_http_session = None
 
     async def _send_history_on_reconnect(self, session):
         """

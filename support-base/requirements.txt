@@ -20,6 +20,7 @@ gunicorn==21.2.0
 # HTTP Client & Utilities
 httpx>=0.25.0
 requests>=2.31.0
+aiohttp>=3.9.0
 
 # Text Encoding Fix (文字化け修正)
 ftfy>=6.1.0

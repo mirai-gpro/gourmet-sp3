@@ -1,6 +1,7 @@
 ---
 // Concierge.astro - コンシェルジュモードUI (チャットモードと同様の機能)
 import ReservationModal from './ReservationModal.astro';
+import LAMAvatar from './LAMAvatar.astro';
 
 export interface Props {
   apiBaseUrl?: string;
@@ -50,7 +51,8 @@ const { apiBaseUrl = '' } = Astro.props;
 
   <div class="avatar-stage" id="avatarStage">
     <div class="avatar-container">
-      <img id="avatarImage" src="/images/avatar-anime.png" alt="AI Avatar" class="avatar-img" />
+      <LAMAvatar />
+      <!-- フォールバック: LAMAvatarが初期化できない場合は内部で2D画像を表示 -->
     </div>
   </div>
 
@@ -143,13 +145,13 @@ const { apiBaseUrl = '' } = Astro.props;
 }
 
 .avatar-container {
-  width: 110px;
-  height: 110px;
+  width: 100%;
+  height: 100%;
   position: relative;
-  transition: transform 0.3s ease;
   z-index: 10;
 }
 
+/* 2Dフォールバック用 */
 .avatar-img {
   width: 100%;
   height: 100%;
