@@ -151,9 +151,6 @@ export class CoreController {
     this.isProcessing = false;
     this.isAISpeaking = false;
     this.isFromVoiceInput = false;
-    // ★ LiveAPIセッションをリセット
-    this.terminateLiveSession();
-
     await new Promise(resolve => setTimeout(resolve, 300));
     await this.initializeSession();
 
@@ -270,8 +267,17 @@ export class CoreController {
 
     // ★ LiveAPIリスナー（仕様書02 セクション4.4.2）
     this.socket.on('live_ready', () => {
-      console.log('[LiveAPI] live_ready受信');
-      this.liveAudioManager.startStreaming();
+      console.log('[LiveAPI] live_ready受信 → greeting_done待機');
+      // ★ startStreaming()は呼ばない。greeting_done を待つ。
+      //   理由: send_client_content（挨拶）と send_realtime_input（マイク音声）の
+      //         混在はLiveAPI SDK非推奨（ChatGPT/Gemini助言）
+    });
+
+    this.socket.on('greeting_done', () => {
+      console.log('[LiveAPI] greeting_done受信 → マイクOFF状態で待機（ユーザータップ待ち）');
+      // ★ startStreaming()は呼ばない。ユーザーがマイクボタンを押すまでOFF状態。
+      //   理由: iOSではユーザージェスチャーなしのマイク有効化がセキュリティ制約に抵触する。
+      //   マイクON/OFFはtoggleRecording()で制御する。
     });
 
     this.socket.on('live_audio', (data: any) => {
@@ -350,26 +356,27 @@ export class CoreController {
       console.log('[LiveAPI] 再接続完了');
     });
 
-    this.socket.on('live_fallback', (data: any) => {
-      console.log('[LiveAPI] フォールバック:', data?.reason);
-    });
-
     this.socket.on('live_stopped', () => {
       console.log('[LiveAPI] live_stopped');
       this.isLiveMode = false;
     });
 
-    // ★ ショップ検索結果受信（v2: カード表示のみ、音声はLiveAPIから届く）
+    // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
-      console.log('[LiveAPI] shop_search_result:', data.shops?.length, '件');
-      if (data.shops && data.shops.length > 0) {
-        this.currentShops = data.shops;
+      console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
+      const shops = data?.shops || [];
+      if (shops.length > 0) {
+        this.currentShops = shops;
         this.els.reservationBtn.classList.add('visible');
         document.dispatchEvent(new CustomEvent('displayShops', {
-          detail: { shops: data.shops, language: this.currentLanguage }
+          detail: { shops: shops, language: this.currentLanguage }
         }));
         const section = document.getElementById('shopListSection');
         if (section) section.classList.add('has-shops');
+
+        if (data.response) {
+          this.addMessage('assistant', data.response);
+        }
 
         if (window.innerWidth < 1024) {
           setTimeout(() => {
@@ -377,9 +384,6 @@ export class CoreController {
             if (shopSection) shopSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
           }, 300);
         }
-      }
-      if (data.response) {
-        this.addMessage('assistant', data.response);
       }
     });
   }
@@ -426,12 +430,19 @@ export class CoreController {
     this.enableAudioPlayback();
     this.els.userInput.value = '';
 
-    // ★ LiveAPIモード中 → 停止（仕様書02 セクション4.4.2）
+    // ★ LiveAPIモード中 → ストリーミングのトグル（セッションは維持）
     if (this.isLiveMode) {
-      this.terminateLiveSession();
-      this.isRecording = false;
-      this.els.micBtn.classList.remove('recording');
-      this.resetInputState();
+      if (this.isRecording) {
+        // マイクOFF: ストリーミング停止
+        this.liveAudioManager.stopStreaming();
+        this.isRecording = false;
+        this.els.micBtn.classList.remove('recording');
+      } else {
+        // マイクON: ストリーミング再開
+        this.liveAudioManager.startStreaming();
+        this.isRecording = true;
+        this.els.micBtn.classList.add('recording');
+      }
       return;
     }
 
@@ -548,10 +559,6 @@ export class CoreController {
       throw error;
     }
   }
-
-  // handleShopSearchFromLiveAPI() は v2 で廃止
-  // ショップ検索→説明は全てサーバー側で処理（仕様書02v2 セクション5.5.3）
-  // ショップカード表示は shop_search_result イベントハンドラで処理
 
   protected terminateLiveSession(): void {
     if (this.isLiveMode && this.socket && this.socket.connected) {

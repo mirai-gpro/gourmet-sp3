@@ -741,66 +741,8 @@ def health_check():
 # LiveAPI セッション管理（仕様書02 セクション3.5）
 # ========================================
 
-def _shop_search_internal(session_id: str, user_request: str,
-                          language: str, mode: str) -> dict:
-    """
-    LiveAPIセッションから呼ばれるショップ検索コールバック
-    （仕様書02v2 セクション5.4.1）
-
-    既存の SupportAssistant.process_user_message() を内部的に呼び出し、
-    ショップデータ(JSON)のみを返す。音声生成はしない。
-    """
-    try:
-        session = SupportSession(session_id)
-        session_data = session.get_data()
-        if not session_data:
-            logger.error(f"[ShopSearch] セッション見つからず: {session_id}")
-            return None
-
-        session.update_language(language)
-        session.update_mode(mode)
-        session.add_message('user', user_request, 'chat')
-
-        assistant = SupportAssistant(session, SYSTEM_PROMPTS)
-        result = assistant.process_user_message(user_request, 'conversation')
-
-        session.add_message('model', result['response'], 'chat')
-
-        shops = result.get('shops') or []
-        response_text = result['response']
-
-        if shops:
-            area = extract_area_from_text(user_request, language)
-            shops = enrich_shops_with_photos(shops, area, language) or []
-
-            if shops:
-                # テキスト応答を構築（チャット欄表示用）
-                shop_messages = {
-                    'ja': lambda c: f"ご希望に合うお店を{c}件ご紹介します。\n\n",
-                    'en': lambda c: f"Here are {c} restaurant recommendations for you.\n\n",
-                    'zh': lambda c: f"为您推荐{c}家餐厅。\n\n",
-                    'ko': lambda c: f"고객님께 {c}개의 식당을 추천합니다.\n\n",
-                }
-                intro_fn = shop_messages.get(language, shop_messages['ja'])
-                shop_list = []
-                for i, shop in enumerate(shops, 1):
-                    name = shop.get('name', '')
-                    shop_area = shop.get('area', '')
-                    description = shop.get('description', '')
-                    if shop_area:
-                        shop_list.append(f"{i}. **{name}**({shop_area}): {description}")
-                    else:
-                        shop_list.append(f"{i}. **{name}**: {description}")
-                response_text = intro_fn(len(shops)) + "\n\n".join(shop_list)
-
-        return {'shops': shops, 'response': response_text}
-
-    except Exception as e:
-        logger.error(f"[ShopSearch] 内部検索エラー: {e}")
-        return None
-
-
 active_live_sessions = {}  # {client_sid: LiveAPISession}
+greeted_client_sids = set()  # 挨拶済みのclient_sid
 
 @socketio.on('live_start')
 def handle_live_start(data):
@@ -837,7 +779,28 @@ def handle_live_start(data):
 
     system_prompt = build_system_instruction(mode, user_profile=user_profile)
 
-    # LiveAPIセッション作成（v2: shop_search_callback を注入）
+    # ショップ検索コールバック（v5 §5.5: SupportAssistant経由でデータ取得）
+    def shop_search_callback(user_request, lang, search_mode):
+        """LiveAPIからのfunction calling時にショップデータを取得する"""
+        try:
+            session = SupportSession(session_id)
+            session_data = session.get_data()
+            if not session_data:
+                logger.error(f"[ShopSearch] セッション {session_id} が見つかりません")
+                return None
+            session.update_language(lang)
+            session.update_mode(search_mode)
+            session.add_message('user', user_request, 'chat')
+            assistant = SupportAssistant(session, SYSTEM_PROMPTS)
+            result = assistant.process_user_message(user_request, 'conversation')
+            if result.get('shops'):
+                session.add_message('model', result['response'], 'chat')
+            return result
+        except Exception as e:
+            logger.error(f"[ShopSearch] コールバックエラー: {e}", exc_info=True)
+            return None
+
+    # LiveAPIセッション作成
     live_session = LiveAPISession(
         session_id=session_id,
         mode=mode,
@@ -845,8 +808,15 @@ def handle_live_start(data):
         system_prompt=system_prompt,
         socketio=socketio,
         client_sid=client_sid,
-        shop_search_callback=_shop_search_internal
+        shop_search_callback=shop_search_callback
     )
+    # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
+    #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
+    if client_sid in greeted_client_sids:
+        live_session.session_count = 1  # 初回扱いにしない
+    else:
+        greeted_client_sids.add(client_sid)
+
     active_live_sessions[client_sid] = live_session
 
     # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
@@ -868,6 +838,10 @@ def handle_live_start(data):
     thread.start()
 
     emit('live_ready', {'status': 'connected'})
+
+    # ★ 挨拶済みの場合、greeting_doneも即座にemit（§5.3 ソフトリロード対応）
+    if client_sid in greeted_client_sids:
+        emit('greeting_done', {})
 
 
 @socketio.on('live_audio_in')
@@ -921,6 +895,8 @@ def handle_disconnect():
         live_session.stop()
         del active_live_sessions[request.sid]
         logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
+    # 挨拶済みフラグのクリーンアップ
+    greeted_client_sids.discard(request.sid)
     # STTストリームのクリーンアップ
     if request.sid in active_streams:
         stream_data = active_streams[request.sid]
