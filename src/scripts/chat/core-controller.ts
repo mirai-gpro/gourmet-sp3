@@ -275,10 +275,8 @@ export class CoreController {
     });
 
     this.socket.on('greeting_done', () => {
-      console.log('[LiveAPI] greeting_done受信 → マイク送信開始');
-      this.liveAudioManager.startStreaming();
-      this.isRecording = true;
-      this.els.micBtn.classList.add('recording');
+      console.log('[LiveAPI] greeting_done受信');
+      // 挨拶完了。マイク送信はユーザーのマイクボタンクリックで開始
     });
 
     this.socket.on('live_audio', (data: any) => {
@@ -418,8 +416,8 @@ export class CoreController {
       this.els.speakerBtn.classList.remove('disabled');
       this.els.reservationBtn.classList.remove('visible');
 
-      // 3. ★ LiveAPI起動は初回マイクボタンクリック時に行う（iOS getUserMedia制約対策）
-      //    greeting_done受信後にstartStreamingが呼ばれる
+      // 3. ★ LiveAPIで初期挨拶を開始（再生のみ、マイクはユーザージェスチャー時に初期化）
+      await this.startLiveMode();
 
     } catch (e) {
       console.error('[Session] Initialization error:', e);
@@ -430,13 +428,15 @@ export class CoreController {
     this.enableAudioPlayback();
     this.els.userInput.value = '';
 
-    // ★ FIX: LiveAPIモード中 → マイクON/OFFトグル（セッション維持）
+    // ★ LiveAPIモード中 → マイクON/OFFトグル（セッション維持）
     if (this.isLiveMode) {
       if (this.isRecording) {
         this.liveAudioManager.stopStreaming();
         this.isRecording = false;
         this.els.micBtn.classList.remove('recording');
       } else {
+        // マイク未初期化ならユーザージェスチャー内で初期化（iOS対策）
+        await this.liveAudioManager.initMicrophone();
         this.liveAudioManager.startStreaming();
         this.isRecording = true;
         this.els.micBtn.classList.add('recording');
@@ -538,8 +538,8 @@ export class CoreController {
     }
 
     try {
-      // LiveAudioManager初期化（マイク取得 + AudioWorklet設定）
-      await this.liveAudioManager.initialize(this.socket);
+      // LiveAudioManager再生初期化（マイクはユーザージェスチャー時に遅延初期化）
+      this.liveAudioManager.initPlayback(this.socket);
 
       // サーバーにLiveAPIセッション開始を通知
       this.socket.emit('live_start', {

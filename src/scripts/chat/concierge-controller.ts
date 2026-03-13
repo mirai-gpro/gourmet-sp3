@@ -77,8 +77,8 @@ export class ConciergeController extends CoreController {
       this.els.speakerBtn.classList.remove('disabled');
       this.els.reservationBtn.classList.remove('visible');
 
-      // 3. ★ LiveAPI起動は初回マイクボタンクリック時に行う（iOS getUserMedia制約対策）
-      //    greeting_done受信後にstartStreamingが呼ばれる
+      // 3. ★ LiveAPIで初期挨拶を開始（再生のみ、マイクはユーザージェスチャー時に初期化）
+      await this.startLiveMode();
 
     } catch (e) {
       console.error('[Session] Initialization error:', e);
