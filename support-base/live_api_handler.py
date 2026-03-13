@@ -473,7 +473,7 @@ class LiveAPISession:
                         timeout=0.1
                     )
                     await session.send_realtime_input(
-                        audio={"data": audio_data, "mime_type": "audio/pcm"}
+                        audio={"data": audio_data, "mime_type": "audio/pcm;rate=16000"}
                     )
                 except asyncio.TimeoutError:
                     continue
@@ -550,6 +550,9 @@ class LiveAPISession:
                         # 初期あいさつフェーズ終了（仕様書02 セクション4.5.5）
                         if self._is_initial_greeting_phase:
                             self._is_initial_greeting_phase = False
+                            self.socketio.emit('greeting_done', {},
+                                               room=self.client_sid)
+                            logger.info("[LiveAPI] greeting_done送信")
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:

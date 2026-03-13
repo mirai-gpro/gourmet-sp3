@@ -151,9 +151,6 @@ export class CoreController {
     this.isProcessing = false;
     this.isAISpeaking = false;
     this.isFromVoiceInput = false;
-    // ★ LiveAPIセッションをリセット
-    this.terminateLiveSession();
-
     await new Promise(resolve => setTimeout(resolve, 300));
     await this.initializeSession();
 
@@ -270,8 +267,17 @@ export class CoreController {
 
     // ★ LiveAPIリスナー（仕様書02 セクション4.4.2）
     this.socket.on('live_ready', () => {
-      console.log('[LiveAPI] live_ready受信');
+      console.log('[LiveAPI] live_ready受信 → greeting_done待機');
+      // ★ startStreaming()は呼ばない。greeting_done を待つ。
+      //   理由: send_client_content（挨拶）と send_realtime_input（マイク音声）の
+      //         混在はLiveAPI SDK非推奨（ChatGPT/Gemini助言）
+    });
+
+    this.socket.on('greeting_done', () => {
+      console.log('[LiveAPI] greeting_done受信 → ストリーミング開始');
       this.liveAudioManager.startStreaming();
+      this.isRecording = true;
+      this.els.micBtn.classList.add('recording');
     });
 
     this.socket.on('live_audio', (data: any) => {
@@ -424,12 +430,19 @@ export class CoreController {
     this.enableAudioPlayback();
     this.els.userInput.value = '';
 
-    // ★ LiveAPIモード中 → 停止（v5仕様書: RESTフォールバックなし）
+    // ★ LiveAPIモード中 → ストリーミングのトグル（セッションは維持）
     if (this.isLiveMode) {
-      this.terminateLiveSession();
-      this.isRecording = false;
-      this.els.micBtn.classList.remove('recording');
-      this.resetInputState();
+      if (this.isRecording) {
+        // マイクOFF: ストリーミング停止
+        this.liveAudioManager.stopStreaming();
+        this.isRecording = false;
+        this.els.micBtn.classList.remove('recording');
+      } else {
+        // マイクON: ストリーミング再開
+        this.liveAudioManager.startStreaming();
+        this.isRecording = true;
+        this.els.micBtn.classList.add('recording');
+      }
       return;
     }
 

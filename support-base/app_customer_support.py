@@ -742,6 +742,7 @@ def health_check():
 # ========================================
 
 active_live_sessions = {}  # {client_sid: LiveAPISession}
+greeted_client_sids = set()  # 挨拶済みのclient_sid
 
 @socketio.on('live_start')
 def handle_live_start(data):
@@ -809,6 +810,13 @@ def handle_live_start(data):
         client_sid=client_sid,
         shop_search_callback=shop_search_callback
     )
+    # ★ 挨拶ガード: 同一client_sidで既に挨拶済みなら session_count を1に設定
+    #    → run() 内で session_count > 1 の分岐に入り、挨拶をスキップ
+    if client_sid in greeted_client_sids:
+        live_session.session_count = 1  # 初回扱いにしない
+    else:
+        greeted_client_sids.add(client_sid)
+
     active_live_sessions[client_sid] = live_session
 
     # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
@@ -830,6 +838,10 @@ def handle_live_start(data):
     thread.start()
 
     emit('live_ready', {'status': 'connected'})
+
+    # ★ 挨拶済みの場合、greeting_doneも即座にemit（§5.3 ソフトリロード対応）
+    if client_sid in greeted_client_sids:
+        emit('greeting_done', {})
 
 
 @socketio.on('live_audio_in')
@@ -883,6 +895,8 @@ def handle_disconnect():
         live_session.stop()
         del active_live_sessions[request.sid]
         logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
+    # 挨拶済みフラグのクリーンアップ
+    greeted_client_sids.discard(request.sid)
     # STTストリームのクリーンアップ
     if request.sid in active_streams:
         stream_data = active_streams[request.sid]
