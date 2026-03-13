@@ -5,38 +5,56 @@
 ### 1.1 目的
 コンシェルジュモードの2Dアバター画像（CSSアニメーション）を、Gaussian Splatting 3Dアバター + ARKit 52ブレンドシェイプによるリアルタイムリップシンクに置き換える。
 
-### 1.2 実証テスト済みコンポーネント
+### 1.2 現行アーキテクチャの前提（重要）
+
+**REST TTS は完全廃止済み。** 全音声はGemini LiveAPI経由のPCMストリーミングで処理される。
+
+| 項目 | 現行実装 |
+|------|---------|
+| 音声ソース | Gemini LiveAPI（PCM 24kHz 16bit mono） |
+| 音声転送 | Socket.IO `live_audio` イベント（base64 PCM） |
+| 音声再生 | `LiveAudioManager` — Web Audio API (`AudioBufferSourceNode` キュー) |
+| HTML `<audio>` | **使用しない**（`ttsPlayer` は廃止済み） |
+| A2E統合 | `app_customer_support.py` L129-161 に既存（REST TTS用のみ） |
+
+**したがって、フェーズ2のメイン課題は：**
+1. バックエンド：LiveAPI PCMチャンクをA2Eサービスに送信し、expressionフレームをSocket.IOで転送
+2. フロントエンド：Web Audio API再生キューとexpressionフレームの同期（`AudioContext.currentTime` ベース）
+
+### 1.3 実証テスト済みコンポーネント
 | コンポーネント | 実証元 | 状態 |
 |------------|--------|------|
 | Audio2Expression サービス | `C:\Users\hamad\audio2exp-service` | デプロイ済み・動作確認済み |
-| support-base A2E統合 | `app_customer_support.py` L129-161, L543-564 | 実装済み |
+| support-base A2E統合（REST TTS用） | `app_customer_support.py` L129-161, L543-564 | 実装済み |
 | LAMAvatar コンポーネント | `LAM_gpro` リポジトリ | 実証テスト済み |
-| audio-sync-player | `LAM_gpro` リポジトリ | 実証テスト済み |
+| audio-sync-player | `LAM_gpro` リポジトリ | 実証テスト済み（★本フェーズで活用） |
 | lam-websocket-manager | `LAM_gpro` リポジトリ | 実証テスト済み |
 | Gaussian Splatモデル | `concierge.zip` (4.09MB) | 作成済み |
 
-### 1.3 対象ファイル
+### 1.4 対象ファイル
 
 #### 移植元（LAM_gpro リポジトリ）
 ```
 LAM_gpro/gourmet-sp/
-├── src/components/LAMAvatar.astro          → 新規追加
-├── src/scripts/lam/audio-sync-player.ts    → 新規追加
-├── src/scripts/lam/lam-websocket-manager.ts → 新規追加
+├── src/components/LAMAvatar.astro          → 新規追加（改修必要）
+├── src/scripts/lam/audio-sync-player.ts    → 新規追加（★中心的に活用）
+├── src/scripts/lam/lam-websocket-manager.ts → 新規追加（ARKit定数利用）
 └── public/avatar/concierge.zip             → 新規追加
 ```
 
 #### 修正対象（gourmet-sp3）
 ```
+support-base/live_api_handler.py            → A2Eバッファリング＋expression転送（★中心課題）
+src/scripts/chat/live-audio-manager.ts      → expression同期メカニズム追加（★中心課題）
+src/scripts/chat/core-controller.ts         → live_expression イベント受信・適用
+src/scripts/chat/concierge-controller.ts    → LAMAvatar連携
 src/components/Concierge.astro              → アバターステージをLAMAvatar埋め込みに変更
-src/scripts/chat/concierge-controller.ts    → A2Eリップシンク統合
 ```
 
-#### バックエンド
+#### バックエンド（デプロイ関連）
 ```
 audio2exp-service/                          → 新規ディレクトリとして移植
 .github/workflows/deploy-audio2exp.yml      → 新規：自動デプロイ設定
-support-base/                               → 変更なし（対応済み）
 ```
 
 ---
@@ -46,97 +64,605 @@ support-base/                               → 変更なし（対応済み）
 ### 2.1 全体データフロー
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ フロントエンド（Astro + TypeScript）                       │
-│                                                         │
-│  ┌──────────────┐    ┌───────────────────────┐          │
-│  │ concierge-   │    │ LAMAvatar.astro        │          │
-│  │ controller   │    │ (Gaussian Splat        │          │
-│  │ .ts          │    │  Renderer)             │          │
-│  │              │    │                        │          │
-│  │ TTS応答受信  │───→│ queueExpressionFrames()│          │
-│  │ expression   │    │ getExpressionData()    │          │
-│  │ data抽出     │    │ @60fps描画ループ        │          │
-│  │              │    │                        │          │
-│  │ ttsPlayer    │───→│ setExternalTtsPlayer() │          │
-│  │ (HTML Audio) │    │ currentTime同期        │          │
-│  └──────┬───────┘    └───────────────────────┘          │
-│         │                                               │
-└─────────┼───────────────────────────────────────────────┘
-          │ POST /api/tts/synthesize
-          ▼
-┌─────────────────────────────────────────────────────────┐
-│ support-base（Cloud Run）                                │
-│                                                         │
-│  TTS合成 (Google Cloud TTS)                              │
-│       │                                                 │
-│       │ MP3 audio_base64                                │
-│       ▼                                                 │
-│  get_expression_frames()                                │
-│       │ POST /api/audio2expression                      │
-│       ▼                                                 │
-│  レスポンス: { audio, expression: {names, frames, frame_rate} }│
-└─────────┼───────────────────────────────────────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────┐
-│ audio2exp-service（Cloud Run / 別サービス）               │
-│                                                         │
-│  入力: MP3 audio (base64)                                │
-│  処理: Audio → ARKit 52 Blendshape Expression            │
-│  出力: { names: string[52], frames: [{weights: float[52]}], │
-│         frame_rate: 30 }                                │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ フロントエンド（Astro + TypeScript）                            │
+│                                                              │
+│  ┌──────────────────┐    ┌───────────────────────┐           │
+│  │ core-controller  │    │ LAMAvatar.astro        │           │
+│  │ .ts              │    │ (Gaussian Splat        │           │
+│  │                  │    │  Renderer)             │           │
+│  │ Socket.IO受信:   │    │                        │           │
+│  │ 'live_audio'     │    │ getExpressionData()    │           │
+│  │ 'live_expression'│───→│ @60fps描画ループ        │           │
+│  │                  │    │                        │           │
+│  └──────┬───────────┘    └───────────────────────┘           │
+│         │                                                    │
+│  ┌──────▼───────────┐                                        │
+│  │ LiveAudioManager │ ← expression同期タイムスタンプ管理        │
+│  │ (Web Audio API)  │                                        │
+│  │ PCM 24kHz再生    │                                        │
+│  │ AudioContext     │                                        │
+│  │ .currentTime同期 │                                        │
+│  └──────────────────┘                                        │
+└──────────┬───────────────────────────────────────────────────┘
+           │ Socket.IO (双方向)
+           │
+┌──────────▼───────────────────────────────────────────────────┐
+│ support-base（Cloud Run）                                     │
+│                                                              │
+│  ┌─────────────────────────────────────┐                     │
+│  │ live_api_handler.py                 │                     │
+│  │                                     │                     │
+│  │ Gemini LiveAPI ←→ _receive_and_forward()                  │
+│  │                    │                │                     │
+│  │                    │ PCMチャンク受信  │                     │
+│  │                    ▼                │                     │
+│  │              A2Eバッファ            │                     │
+│  │              (PCMチャンク蓄積)       │                     │
+│  │                    │                │                     │
+│  │          ┌─────────▼──────────┐     │                     │
+│  │          │ 十分な長さに達したら │     │                     │
+│  │          │ A2Eサービスに送信   │     │                     │
+│  │          └─────────┬──────────┘     │                     │
+│  │                    │                │                     │
+│  │          ┌─────────▼──────────┐     │                     │
+│  │          │ emit('live_audio') │     │                     │
+│  │          │ emit('live_expression') │  │                     │
+│  │          └────────────────────┘     │                     │
+│  └─────────────────────────────────────┘                     │
+│                    │                                         │
+└────────────────────┼─────────────────────────────────────────┘
+                     │ POST /api/audio2expression
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│ audio2exp-service（Cloud Run / 別サービス）                     │
+│                                                              │
+│  入力: PCM audio (base64) or MP3                              │
+│  処理: Audio → ARKit 52 Blendshape Expression                 │
+│  出力: { names: string[52],                                   │
+│         frames: [{weights: float[52]}],                      │
+│         frame_rate: 30 }                                     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 同期メカニズム（External TTS Playerモード）
+### 2.2 同期メカニズム（LiveAPI PCMストリーミング）
+
+**課題：** LiveAPIの音声はPCMチャンクとして非同期に到着する。HTML `<audio>` の `currentTime` は使えない。
+
+**解決策：** `AudioContext.currentTime` + 再生オフセット追跡
 
 ```
 時間軸 →
-────────────────────────────────────────────────
+─────────────────────────────────────────────────────────
 
-ttsPlayer:  [────────── MP3再生中 ──────────]
-            ↑play                         ↑ended
-            │                              │
-currentTime: 0.0s ─── 0.5s ─── 1.0s ─── 1.5s
+PCMチャンク到着:  [chunk1][chunk2][chunk3]...[chunkN]
+                  │       │       │
+                  ▼       ▼       ▼
+Web Audio再生:    ┣━━━━━━━┫━━━━━━━┫━━━━━━━┫─────────────
+                  ↑ startTime      ↑ nextPlayTime
+                  │
+                  scheduleTime = AudioContext.currentTime
 
-Expression:  frame[0] frame[15] frame[30] frame[45]
-             │        │         │         │
-             ▼        ▼         ▼         ▼
-Avatar:      口閉じ → 開き → 閉じ → 開き → 閉じ
+Expression到着:   [expr_batch_1]        [expr_batch_2]
+(A2Eバッチ応答)    │                     │
+                  ▼                     ▼
+                  frameBuffer に追加     frameBuffer に追加
 
-フレーム計算:
-  frameIndex = Math.floor((ttsPlayer.currentTime * 1000 / 1000) * frameRate)
-  → frameRate=30の場合、1秒間に30フレームの表情データを適用
-
-フェードイン/アウト:
-  - 最初の6フレーム（~200ms @ 30fps）: alpha 0→1
-  - 最後の6フレーム（~200ms @ 30fps）: alpha 1→0
-  - Gaussian Splatの歪みアーティファクト防止
+同期計算:
+  playbackOffset = AudioContext.currentTime - firstChunkStartTime
+  frameIndex = Math.floor(playbackOffset * frameRate)
+  → frameBuffer[frameIndex] の ExpressionData を適用
 ```
 
-### 2.3 REST TTS vs LiveAPI音声の使い分け
+**バッファリング戦略（バックエンド）：**
+```
+PCMチャンク蓄積:
+  - LiveAPIからのチャンクを受信のたびバッファに追加
+  - バッファが閾値（例: 0.5秒分 = 12,000サンプル @ 24kHz）に達したらA2Eに送信
+  - A2Eレスポンスを 'live_expression' イベントでフロントエンドに転送
+  - 同時に 'live_audio' で音声チャンクも転送（既存の挙動を維持）
+```
 
-| 音声ソース | A2Eリップシンク | 理由 |
-|-----------|----------------|------|
-| REST TTS（`/api/tts/synthesize`） | **適用する** | MP3完成後にA2E処理、expressionデータ同梱で遅延ゼロ |
-| LiveAPI音声出力（ストリーミング） | **適用しない（現時点）** | 短いチャンク（300ms）単位のため、A2Eに十分な音声長がない |
-| ショップ紹介セリフ | **適用する** | REST TTS使用のため上記と同じ |
+### 2.3 LAM_gpro の audio-sync-player.ts の活用
+
+LAM_gpro の `AudioSyncPlayer` はまさにこのユースケースのために設計されている：
+
+| AudioSyncPlayer の機能 | 本フェーズでの活用 |
+|----------------------|------------------|
+| `firstStartAbsoluteTime` 追跡 | 再生開始からの経過時間でexpression同期 |
+| `getCurrentPlaybackOffset()` | expressionフレームインデックスの計算に使用 |
+| `getSampleIndexForOffset(offsetMs)` | チャンク内のサブオフセット計算 |
+| Int16→Float32変換 | `LiveAudioManager` と同じ処理（統合可能） |
+
+**方針：** `LiveAudioManager` に `AudioSyncPlayer` の同期機能を統合する。
 
 ---
 
-## 3. バックエンド：audio2exp-service の移植とデプロイ
+## 3. バックエンド：live_api_handler.py の修正（★中心課題）
 
-### 3.1 移植方針
+### 3.1 A2Eバッファリング機構の追加
 
-**結論：再デプロイ推奨（自動デプロイ化）**
+`LiveAPISession` クラスに以下を追加：
 
-理由：
-1. 既存デプロイは手動のため、コード変更時に再デプロイの手間が発生
-2. support-baseと同様のCI/CDパイプラインで運用を統一
-3. リポジトリ内にコードがあることでバージョン管理・レビューが可能
+```python
+class LiveAPISession:
+    def __init__(self, ...):
+        # ... 既存の初期化 ...
 
-### 3.2 ディレクトリ構成
+        # ★ A2Eリップシンク用バッファ
+        self._a2e_audio_buffer = bytearray()
+        self._a2e_buffer_threshold = 12000 * 2  # 0.5秒分 (24kHz * 16bit = 2bytes/sample)
+        self._a2e_chunk_index = 0  # expression同期用のチャンクインデックス
+```
+
+### 3.2 _receive_and_forward() の修正
+
+```python
+async def _receive_and_forward(self, session):
+    """音声データ受信時にA2Eバッファリングを追加"""
+    while not self.needs_reconnect and self.is_running:
+        turn = session.receive()
+        async for response in turn:
+            # ... 既存のtool_call, turn_complete等の処理 ...
+
+            if response.server_content and response.server_content.model_turn:
+                for part in response.server_content.model_turn.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        if isinstance(part.inline_data.data, bytes):
+                            audio_bytes = part.inline_data.data
+                            audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+                            # ★ 既存: 音声をブラウザに転送
+                            self.socketio.emit('live_audio',
+                                               {'data': audio_b64},
+                                               room=self.client_sid)
+
+                            # ★ 新規: A2Eバッファに追加
+                            await self._buffer_for_a2e(audio_bytes)
+```
+
+### 3.3 A2Eバッファリング＆送信メソッド（新規）
+
+```python
+async def _buffer_for_a2e(self, pcm_bytes: bytes):
+    """
+    PCMチャンクをバッファし、閾値に達したらA2Eに送信
+
+    【設計根拠】
+    - LiveAPIのPCMチャンクは小さい（数百ms分）
+    - A2Eは0.5秒以上の音声で精度が安定する
+    - バッファリングでA2E呼び出し頻度を抑制（API負荷対策）
+    """
+    if not AUDIO2EXP_SERVICE_URL:
+        return
+
+    self._a2e_audio_buffer.extend(pcm_bytes)
+
+    if len(self._a2e_audio_buffer) >= self._a2e_buffer_threshold:
+        buffer_copy = bytes(self._a2e_audio_buffer)
+        self._a2e_audio_buffer.clear()
+        chunk_index = self._a2e_chunk_index
+        self._a2e_chunk_index += 1
+
+        # 非同期でA2Eに送信（音声再生をブロックしない）
+        asyncio.create_task(
+            self._send_to_a2e(buffer_copy, chunk_index)
+        )
+
+async def _send_to_a2e(self, pcm_bytes: bytes, chunk_index: int):
+    """
+    A2EサービスにバッファされたPCMを送信し、
+    expressionフレームをブラウザに転送
+    """
+    try:
+        audio_b64 = base64.b64encode(pcm_bytes).decode('utf-8')
+
+        # A2Eサービスに送信（PCM 24kHz 16bit monoをそのまま）
+        import aiohttp
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{AUDIO2EXP_SERVICE_URL}/api/audio2expression",
+                json={
+                    "audio_base64": audio_b64,
+                    "session_id": self.session_id,
+                    "audio_format": "pcm_24000_16bit_mono",
+                    "is_start": chunk_index == 0,
+                    "is_final": False,
+                },
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    frames = result.get('frames', [])
+
+                    if frames:
+                        # ★ expressionフレームをブラウザに転送
+                        self.socketio.emit('live_expression', {
+                            'chunk_index': chunk_index,
+                            'names': result.get('names', []),
+                            'frames': frames,
+                            'frame_rate': result.get('frame_rate', 30),
+                        }, room=self.client_sid)
+
+                        logger.debug(
+                            f"[A2E] chunk {chunk_index}: {len(frames)}フレーム送信"
+                        )
+    except Exception as e:
+        logger.warning(f"[A2E] ストリーミング送信エラー: {e}")
+```
+
+### 3.4 ターン完了時のバッファフラッシュ
+
+```python
+def _process_turn_complete(self):
+    """既存のターン完了処理に追加"""
+    # ... 既存の処理 ...
+
+    # ★ A2Eバッファの残りをフラッシュ
+    if self._a2e_audio_buffer:
+        buffer_copy = bytes(self._a2e_audio_buffer)
+        self._a2e_audio_buffer.clear()
+        chunk_index = self._a2e_chunk_index
+        self._a2e_chunk_index += 1
+        asyncio.create_task(
+            self._send_to_a2e(buffer_copy, chunk_index)
+        )
+
+    # バッファインデックスをリセット
+    self._a2e_chunk_index = 0
+```
+
+### 3.5 ショップ説明時の対応
+
+`_receive_shop_description()` でも同じ `_buffer_for_a2e()` を呼び出す：
+
+```python
+async def _receive_shop_description(self, session, shop_number: int):
+    """既存の音声転送箇所にA2Eバッファリングを追加"""
+    # ... 既存のturn受信ループ ...
+
+    # 音声データ（既存部分に追加）
+    if sc.model_turn:
+        for part in sc.model_turn.parts:
+            if hasattr(part, 'inline_data') and part.inline_data:
+                if isinstance(part.inline_data.data, bytes):
+                    audio_bytes = part.inline_data.data
+                    audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                    self.socketio.emit('live_audio',
+                                       {'data': audio_b64},
+                                       room=self.client_sid)
+                    # ★ 追加
+                    await self._buffer_for_a2e(audio_bytes)
+```
+
+### 3.6 A2Eサービスの入力形式拡張
+
+現在の `get_expression_frames()` はMP3入力を想定している。LiveAPIのPCM入力に対応するため、audio2exp-serviceで `audio_format: "pcm_24000_16bit_mono"` を受け付けるよう拡張する。
+
+```python
+# audio2exp-service/app.py に追加
+# 既存のMP3入力に加えて、PCM入力も受け付ける
+if audio_format == "pcm_24000_16bit_mono":
+    # PCMを直接処理（pydub変換不要）
+    audio_data = base64.b64decode(audio_base64)
+    # 24kHz 16bit mono PCM → numpy array
+    samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    # ... A2E推論処理 ...
+```
+
+---
+
+## 4. フロントエンド：LiveAudioManager の拡張（★中心課題）
+
+### 4.1 expression同期機能の追加
+
+`live-audio-manager.ts` に `AudioSyncPlayer` の同期メカニズムを統合：
+
+```typescript
+export class LiveAudioManager {
+    // ... 既存のフィールド ...
+
+    // ★ Expression同期用（AudioSyncPlayerから移植）
+    private firstChunkStartTime: number = 0;  // 最初のチャンク再生開始時の AudioContext.currentTime
+    private isFirstChunk: boolean = true;
+    private expressionFrameBuffer: ExpressionData[] = [];
+    private expressionFrameRate: number = 30;
+    private expressionNames: string[] = [];
+
+    // ★ 再生オフセット追跡
+    getCurrentPlaybackOffset(): number {
+        if (!this.audioContext || this.firstChunkStartTime === 0) return 0;
+        return (this.audioContext.currentTime - this.firstChunkStartTime) * 1000; // ms
+    }
+
+    // ★ 現在のexpressionフレームを取得（LAMAvatarの描画ループから呼ばれる）
+    getCurrentExpressionFrame(): ExpressionData | null {
+        if (this.expressionFrameBuffer.length === 0) return null;
+        if (!this.isAiSpeaking) return null;
+
+        const offsetMs = this.getCurrentPlaybackOffset();
+        const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
+
+        if (frameIndex < 0 || frameIndex >= this.expressionFrameBuffer.length) {
+            return null;
+        }
+
+        return this.expressionFrameBuffer[frameIndex];
+    }
+```
+
+### 4.2 playPcmAudio() の拡張
+
+```typescript
+playPcmAudio(pcmBase64: string): void {
+    if (!this.audioContext) return;
+
+    const pcmBytes = base64ToArrayBuffer(pcmBase64);
+    const int16 = new Int16Array(pcmBytes);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768.0;
+    }
+
+    const buffer = this.audioContext.createBuffer(1, float32.length, 24000);
+    buffer.copyToChannel(float32, 0);
+
+    this.playbackQueue.push(buffer);
+
+    // ★ 最初のチャンクの再生開始時刻を記録
+    if (this.isFirstChunk) {
+        this.isFirstChunk = false;
+        // _processPlaybackQueue で startTime を記録
+    }
+
+    this._processPlaybackQueue();
+}
+
+private _processPlaybackQueue(): void {
+    if (this.isPlaying || this.playbackQueue.length === 0 || !this.audioContext) return;
+
+    this.isPlaying = true;
+    const buffer = this.playbackQueue.shift()!;
+
+    const source = this.audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.audioContext.destination);
+
+    const now = this.audioContext.currentTime;
+    const startTime = Math.max(now, this.nextPlayTime);
+    source.start(startTime);
+
+    // ★ 最初のチャンクの再生開始時刻を記録
+    if (this.firstChunkStartTime === 0) {
+        this.firstChunkStartTime = startTime;
+    }
+
+    this.nextPlayTime = startTime + buffer.duration;
+
+    source.onended = () => {
+        this.isPlaying = false;
+        this._processPlaybackQueue();
+    };
+}
+```
+
+### 4.3 expressionフレーム受信メソッド（新規）
+
+```typescript
+// Socket.IOの 'live_expression' イベントから呼ばれる
+onExpressionReceived(data: {
+    chunk_index: number;
+    names: string[];
+    frames: Array<{ weights: number[] }>;
+    frame_rate: number;
+}): void {
+    this.expressionNames = data.names;
+    this.expressionFrameRate = data.frame_rate;
+
+    // フレームをバッファに追加（chunk_indexに基づく位置に配置）
+    const newFrames = data.frames.map(frame => ({
+        names: data.names,
+        weights: frame.weights
+    }));
+
+    this.expressionFrameBuffer.push(...newFrames);
+}
+```
+
+### 4.4 リセット処理の拡張
+
+```typescript
+onAiResponseStarted(): void {
+    this.isAiSpeaking = true;
+    // ★ expression状態をリセット
+    this.expressionFrameBuffer = [];
+    this.firstChunkStartTime = 0;
+    this.isFirstChunk = true;
+}
+
+onAiResponseEnded(): void {
+    this.isAiSpeaking = false;
+}
+
+clearPlaybackQueue(): void {
+    this.playbackQueue = [];
+    this.isPlaying = false;
+    this.nextPlayTime = 0;
+    // ★ expression状態もクリア
+    this.expressionFrameBuffer = [];
+    this.firstChunkStartTime = 0;
+    this.isFirstChunk = true;
+}
+```
+
+---
+
+## 5. フロントエンド：core-controller.ts の修正
+
+### 5.1 live_expression イベントの受信
+
+`initSocket()` 内に追加：
+
+```typescript
+// ★ A2E expressionフレーム受信
+this.socket.on('live_expression', (data: any) => {
+    if (!this.isLiveMode) return;
+    this.liveAudioManager.onExpressionReceived(data);
+});
+```
+
+### 5.2 LAMAvatar連携
+
+`LAMAvatar.astro` の `getExpressionData()` は既存のexternalTtsPlayerモード（`ttsPlayer.currentTime` 同期）を前提としている。LiveAPIモードでは `LiveAudioManager.getCurrentExpressionFrame()` から直接取得する必要がある。
+
+**2つの方法：**
+
+#### 方法A: LAMAvatarのgetExpressionData()をLiveAudioManager対応に改修
+
+```typescript
+// LAMAvatar.astro 内
+function getExpressionData(): ExpressionData | null {
+    // LiveAPI モード: LiveAudioManager から直接取得
+    const liveManager = (window as any).liveAudioManagerRef;
+    if (liveManager) {
+        return liveManager.getCurrentExpressionFrame();
+    }
+
+    // 旧モード: externalTtsPlayer.currentTime 同期（フォールバック）
+    // ... 既存のロジック ...
+}
+```
+
+#### 方法B: LiveAudioManagerがLAMAvatarのqueueExpressionFrames()を呼ぶ（既存APIを活用）
+
+```typescript
+// core-controller.ts
+this.socket.on('live_expression', (data: any) => {
+    if (!this.isLiveMode) return;
+    this.liveAudioManager.onExpressionReceived(data);
+
+    // LAMAvatarにもフレームをキュー
+    const lamController = (window as any).lamAvatarController;
+    if (lamController) {
+        const frames = data.frames.map((f: any) => ({
+            names: data.names,
+            weights: f.weights
+        }));
+        lamController.queueExpressionFrames(frames, data.frame_rate);
+    }
+});
+```
+
+**推奨：方法A** — LAMAvatarの同期ロジックを `LiveAudioManager` に統一することで、
+`AudioContext.currentTime` ベースの正確な同期が得られる。方法Bは既存の `ttsPlayer.currentTime` 同期ロジックを使い回すが、LiveAPIモードではttsPlayerが存在しないため動作しない。
+
+---
+
+## 6. フロントエンド：LAMAvatar.astro の改修
+
+### 6.1 External TTS Player モードから LiveAudioManager モードへ
+
+LAM_gproの元コードは `setExternalTtsPlayer(player: HTMLAudioElement)` で HTML `<audio>` 要素をバインドし、`player.currentTime` で同期する。
+
+gourmet-sp3では `LiveAudioManager` の `getCurrentPlaybackOffset()` で同期するよう改修：
+
+```typescript
+// LAMAvatar.astro 内のインターフェース変更
+
+interface LAMAvatarController {
+    // 旧: setExternalTtsPlayer(player: HTMLAudioElement): void;
+    // 新:
+    setLiveAudioManager(manager: LiveAudioManager): void;
+    queueExpressionFrames(frames: ExpressionData[], frameRate: number): void;
+    clearFrameBuffer(): void;
+}
+```
+
+### 6.2 getExpressionData() の改修
+
+```typescript
+// 変更前（LAM_gpro）:
+function getExpressionData(): ExpressionData | null {
+    if (!ttsActive || !externalTtsPlayer) return null;
+    const currentTimeMs = externalTtsPlayer.currentTime * 1000;
+    const frameIndex = Math.floor((currentTimeMs / 1000) * frameRate);
+    return frameBuffer[frameIndex];
+}
+
+// 変更後（gourmet-sp3）:
+function getExpressionData(): ExpressionData | null {
+    if (!liveAudioManager) return null;
+    return liveAudioManager.getCurrentExpressionFrame();
+    // フェードイン/アウトは getCurrentExpressionFrame() 内で処理
+}
+```
+
+### 6.3 Concierge.astro の変更
+
+```diff
++import LAMAvatar from './LAMAvatar.astro';
+
+ <div class="avatar-stage" id="avatarStage">
+   <div class="avatar-container">
+-    <img id="avatarImage" src="/images/avatar-anime.png" alt="AI Avatar" class="avatar-img" />
++    <LAMAvatar />
+   </div>
+ </div>
+```
+
+---
+
+## 7. フロントエンド：concierge-controller.ts の修正
+
+### 7.1 LAMAvatar初期化連携
+
+```typescript
+protected async init() {
+    await super.init();
+    // ... 既存のコンシェルジュ固有初期化 ...
+
+    // ★ LAMAvatarにLiveAudioManagerを接続
+    this.linkLamAvatar();
+}
+
+private linkLamAvatar() {
+    const lamController = (window as any).lamAvatarController;
+    if (lamController) {
+        lamController.setLiveAudioManager(this.liveAudioManager);
+    } else {
+        setTimeout(() => this.linkLamAvatar(), 2000);
+    }
+}
+```
+
+### 7.2 speakTextGCP() / CSSアニメーションの削除
+
+現在の `speakTextGCP()` オーバーライドは CSSクラス `speaking` の付け外しのみ。これを削除し、リップシンクは `LiveAudioManager` + `LAMAvatar` の自動同期に委譲する。
+
+```typescript
+// 削除: speakTextGCP() オーバーライド
+// 削除: stopAvatarAnimation()
+// これらはLiveAPIモードでは呼ばれない
+```
+
+### 7.3 stopAllActivities() の修正
+
+```typescript
+protected stopAllActivities() {
+    super.stopAllActivities();
+    // ★ CSSアニメーション停止 → LAMAvatarフレームバッファクリア
+    const lamController = (window as any).lamAvatarController;
+    if (lamController) {
+        lamController.clearFrameBuffer();
+    }
+}
+```
+
+---
+
+## 8. audio2exp-service の移植とデプロイ
+
+### 8.1 ディレクトリ構成
 
 ```
 gourmet-sp3/
@@ -147,13 +673,12 @@ gourmet-sp3/
 │   ├── audio2expression.py         ← A2Eコア処理
 │   ├── models/                     ← 推論モデルファイル
 │   └── ...
-├── support-base/                   ← 変更なし
 └── .github/workflows/
-    ├── deploy-cloud-run.yml        ← 既存（support-base用）
+    ├── deploy-cloud-run.yml        ← 既存（support-base用）+ AUDIO2EXP_SERVICE_URL追加
     └── deploy-audio2exp.yml        ← 新規（audio2exp-service用）
 ```
 
-### 3.3 GitHub Actions：deploy-audio2exp.yml
+### 8.2 GitHub Actions：deploy-audio2exp.yml
 
 ```yaml
 name: Deploy Audio2Exp to Cloud Run
@@ -180,29 +705,15 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
-
-      - name: Create Artifact Registry repository (if not exists)
-        run: |
-          gcloud artifacts repositories describe ${{ env.SERVICE_NAME }} \
-            --location=${{ env.REGION }} \
-            --project=${{ env.PROJECT_ID }} 2>/dev/null || \
-          gcloud artifacts repositories create ${{ env.SERVICE_NAME }} \
-            --repository-format=docker \
-            --location=${{ env.REGION }} \
-            --project=${{ env.PROJECT_ID }}
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
 
       - name: Build and push Docker image
         run: |
@@ -225,391 +736,127 @@ jobs:
             --min-instances=1 \
             --max-instances=3 \
             --timeout=60
-
-      - name: Show deployed URL
-        run: |
-          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
-            --region=${{ env.REGION }} \
-            --project=${{ env.PROJECT_ID }} \
-            --format='value(status.url)')
-          echo "::notice::Audio2Exp deployed to: $URL"
-
-      - name: Health check
-        run: |
-          sleep 10
-          curl -sf "$URL/health" || echo "Health check pending"
 ```
 
-**注意点：**
-- `memory=2Gi`, `cpu=2` — A2E推論はGPU不使用でもCPU/メモリを多く消費
-- `min-instances=1` — コールドスタート排除（推論モデルのロードに時間がかかるため）
-- `max-instances=3` — 同時接続数に応じてスケール
+### 8.3 PCM入力対応の拡張
 
-### 3.4 support-base デプロイ設定の更新
-
-`deploy-cloud-run.yml` に `AUDIO2EXP_SERVICE_URL` を追加：
-
-```yaml
-# 既存の --set-env-vars に追加
---set-env-vars="AUDIO2EXP_SERVICE_URL=${{ secrets.AUDIO2EXP_SERVICE_URL }}"
-```
-
-### 3.5 support-base 側の既存実装（変更不要）
-
-以下は実装済みで変更不要：
-
-| 機能 | ファイル | 行 |
-|------|---------|-----|
-| A2Eサービス設定 | `app_customer_support.py` | L62-68 |
-| `get_expression_frames()` | `app_customer_support.py` | L129-161 |
-| TTS応答にexpression同梱 | `app_customer_support.py` | L543-564 |
-| ヘルスチェックでA2E状態報告 | `app_customer_support.py` | L735 |
+`audio2exp-service` に `audio_format: "pcm_24000_16bit_mono"` を受け付けるよう拡張が必要。
+現在はMP3入力のみ対応のため、PCMの直接処理パスを追加する。
 
 ---
 
-## 4. フロントエンド：ファイル追加
-
-### 4.1 追加ファイル一覧
-
-LAM_gpro リポジトリ (`claude/update-lam-modelscope-UQKxj` ブランチ) から移植：
-
-| 移植元 | 移植先 | 説明 |
-|--------|--------|------|
-| `gourmet-sp/src/components/LAMAvatar.astro` | `src/components/LAMAvatar.astro` | 3Dアバターコンポーネント |
-| `gourmet-sp/src/scripts/lam/audio-sync-player.ts` | `src/scripts/lam/audio-sync-player.ts` | WebSocket用音声同期プレイヤー |
-| `gourmet-sp/src/scripts/lam/lam-websocket-manager.ts` | `src/scripts/lam/lam-websocket-manager.ts` | LAM WebSocket管理 |
-| `gourmet-sp/public/avatar/concierge.zip` | `public/avatar/concierge.zip` | Gaussian Splatモデル (4.09MB) |
-
-### 4.2 LAMAvatar.astro の主要機能
-
-```typescript
-// グローバルインターフェース
-interface ExpressionData {
-  names: string[];      // ARKit 52 blendshape名
-  weights: number[];    // 各blendshapeの重み (0.0-1.0)
-}
-
-interface LAMAvatarController {
-  queueExpressionFrames(frames: ExpressionData[], frameRate: number): void;
-  clearFrameBuffer(): void;
-  setExternalTtsPlayer(player: HTMLAudioElement): void;
-}
-
-// window.lamAvatarController として公開
-```
-
-**描画ループ（@60fps）：**
-```
-getExpressionData() が renderer から毎フレーム呼ばれる
-  ↓
-ttsPlayer.currentTime から現在のフレームインデックスを計算
-  frameIndex = Math.floor((currentTimeMs / 1000) * frameRate)
-  ↓
-frameBuffer[frameIndex] から ExpressionData を取得
-  ↓
-フェードイン/アウト処理（最初・最後の6フレーム）
-  ↓
-renderer が blendshape を Gaussian Splat に適用
-```
-
-**依存パッケージ：**
-```
-gaussian-splat-renderer-for-lam   ← npm パッケージ（GaussianSplats3D フォーク）
-```
-
-### 4.3 audio-sync-player.ts
-
-WebSocket経由のバンドルモード用。現段階では**直接は使用しない**が、将来LiveAPI音声ストリーミング対応時に必要になる可能性があるため移植しておく。
-
-- Web Audio API ベースの再生キュー
-- Int16 → Float32 変換
-- 再生オフセット追跡（`getCurrentPlaybackOffset()`）
-
-### 4.4 lam-websocket-manager.ts
-
-OpenAvatarChat バックエンドとの通信用。現段階では**直接は使用しない**が、JBIN形式パーサーとARKit定数定義を含むため移植しておく。
-
-- JBIN バイナリプロトコルのパーサー
-- ARKit 52 チャンネル名定数 (`ARKIT_CHANNEL_NAMES`)
-- WebSocket接続管理（自動再接続、keepalive）
-
----
-
-## 5. フロントエンド：既存ファイル修正
-
-### 5.1 Concierge.astro の変更
-
-**変更内容：** アバターステージを2D画像からLAMAvatarコンポーネントに置換
-
-```diff
- <!-- 変更前 -->
- <div class="avatar-stage" id="avatarStage">
-   <div class="avatar-container">
--    <img id="avatarImage" src="/images/avatar-anime.png" alt="AI Avatar" class="avatar-img" />
-+    <LAMAvatar />
-   </div>
- </div>
-```
-
-- `LAMAvatar.astro` をインポート
-- 2D画像 (`avatar-anime.png`) はフォールバック用にLAMAvatar内部で保持
-- `.avatar-container` のCSSを3Dレンダリング用に調整（canvasサイズ対応）
-
-### 5.2 concierge-controller.ts の変更
-
-#### 5.2.1 TTS Player リンク（init時）
-
-```typescript
-// init() 内に追加
-private linkLamAvatar() {
-  const lamController = (window as any).lamAvatarController;
-  if (lamController) {
-    lamController.setExternalTtsPlayer(this.ttsPlayer);
-  } else {
-    // LAMAvatar初期化待ち（2秒後リトライ）
-    setTimeout(() => this.linkLamAvatar(), 2000);
-  }
-}
-```
-
-#### 5.2.2 speakTextGCP() のオーバーライド修正
-
-```typescript
-// 変更前: CSSクラスの付け外しのみ
-protected async speakTextGCP(text, stopPrevious, autoRestartMic, skipAudio) {
-  // avatarContainer.classList.add('speaking');  ← 削除
-  await super.speakTextGCP(text, stopPrevious, autoRestartMic, skipAudio);
-  // avatarContainer.classList.remove('speaking');  ← 削除
-}
-
-// 変更後: TTS応答からexpressionデータを抽出してLAMAvatarに適用
-protected async speakTextGCP(text, stopPrevious, autoRestartMic, skipAudio) {
-  if (skipAudio || !this.isTTSEnabled || !text) return Promise.resolve();
-  if (stopPrevious) this.ttsPlayer.pause();
-
-  const langConfig = this.LANGUAGE_CODE_MAP[this.currentLanguage];
-  const cleanText = this.stripMarkdown(text);
-
-  const response = await fetch(`${this.apiBase}/api/tts/synthesize`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      text: cleanText,
-      language_code: langConfig.tts,
-      voice_name: langConfig.voice,
-      session_id: this.sessionId  // ★ A2E用にsession_idを送信
-    })
-  });
-  const data = await response.json();
-
-  if (data.success) {
-    // ★ expression データがあればLAMAvatarに適用
-    if (data.expression) {
-      this.applyExpressionFromTts(data.expression);
-    }
-
-    this.ttsPlayer.src = `data:audio/mp3;base64,${data.audio}`;
-    await new Promise<void>((resolve) => {
-      this.ttsPlayer.onended = () => resolve();
-      this.ttsPlayer.play();
-    });
-  }
-}
-```
-
-#### 5.2.3 Expression適用メソッド（新規追加）
-
-```typescript
-private applyExpressionFromTts(expression: {
-  names: string[];
-  frames: Array<{ weights: number[] }>;
-  frame_rate: number;
-}) {
-  const lamController = (window as any).lamAvatarController;
-  if (!lamController) return;
-
-  // フレームバッファをクリア
-  lamController.clearFrameBuffer();
-
-  // frames を ExpressionData[] に変換
-  const expressionFrames = expression.frames.map(frame => ({
-    names: expression.names,
-    weights: frame.weights
-  }));
-
-  // キューに追加（再生開始前に完了）
-  lamController.queueExpressionFrames(expressionFrames, expression.frame_rate);
-}
-```
-
-#### 5.2.4 speakResponseInChunks() の修正
-
-並行TTS処理でもexpressionデータを適用するよう修正：
-
-```typescript
-// TTS fetchレスポンスから expression を取り出して適用
-const result = await response.json();
-if (result.success && result.expression) {
-  this.applyExpressionFromTts(result.expression);
-}
-```
-
-**注意：** センテンス分割再生時、各セグメントごとに `clearFrameBuffer()` → `queueExpressionFrames()` を行う。
-
-#### 5.2.5 ショップ紹介TTS部分の修正
-
-`sendMessage()` 内のショップ紹介TTS呼び出し箇所（L541-659）でも、同様にexpressionデータを適用。
-
-#### 5.2.6 stopAvatarAnimation() の修正
-
-```typescript
-// 変更前: CSSクラス操作
-private stopAvatarAnimation() {
-  this.els.avatarContainer?.classList.remove('speaking');
-}
-
-// 変更後: フレームバッファクリア
-private stopAvatarAnimation() {
-  const lamController = (window as any).lamAvatarController;
-  if (lamController) {
-    lamController.clearFrameBuffer();
-  }
-}
-```
-
-### 5.3 session_id の送信追加
-
-現在の `speakTextGCP()`（`core-controller.ts` の親クラス）は `session_id` を TTS APIに送信していない。A2Eサービスが `session_id` を必要とするため、TTS呼び出し時に `session_id` を含める必要がある。
-
-```typescript
-// core-controller.ts の speakTextGCP 内
-body: JSON.stringify({
-  text: cleanText,
-  language_code: langConfig.tts,
-  voice_name: langConfig.voice,
-  session_id: this.sessionId  // ★ 追加
-})
-```
-
----
-
-## 6. npmパッケージ追加
+## 9. npmパッケージ追加
 
 ```bash
 npm install gaussian-splat-renderer-for-lam
 ```
 
-`package.json` に追加される依存：
-```json
-{
-  "dependencies": {
-    "gaussian-splat-renderer-for-lam": "^x.x.x"
-  }
-}
-```
-
 ---
 
-## 7. 実装順序
+## 10. 実装順序
 
-### Step 1: audio2exp-service の移植
-1. `C:\Users\hamad\audio2exp-service` の内容を `gourmet-sp3/audio2exp-service/` にコピー
-2. `.github/workflows/deploy-audio2exp.yml` を作成
-3. `deploy-cloud-run.yml` に `AUDIO2EXP_SERVICE_URL` 環境変数を追加
+### Step 1: audio2exp-service の移植・デプロイ
+1. `C:\Users\hamad\audio2exp-service` を `gourmet-sp3/audio2exp-service/` にコピー
+2. PCM入力対応を追加（`audio_format: "pcm_24000_16bit_mono"`）
+3. `.github/workflows/deploy-audio2exp.yml` を作成
 4. GitHub Secrets に `AUDIO2EXP_SERVICE_URL` を設定
 
-### Step 2: フロントエンド ファイル追加
+### Step 2: バックエンド — live_api_handler.py の修正（★最重要）
+1. `LiveAPISession` に A2Eバッファリング機構を追加
+2. `_receive_and_forward()` に `_buffer_for_a2e()` 呼び出しを追加
+3. `_receive_shop_description()` にも同様の追加
+4. ターン完了時のバッファフラッシュを追加
+5. `live_expression` Socket.IOイベントの送信
+
+### Step 3: フロントエンド — LiveAudioManager の拡張（★最重要）
+1. expression同期フィールドの追加
+2. `getCurrentPlaybackOffset()` メソッドの追加
+3. `getCurrentExpressionFrame()` メソッドの追加
+4. `onExpressionReceived()` メソッドの追加
+5. `playPcmAudio()` に `firstChunkStartTime` 記録を追加
+6. リセット処理の拡張
+
+### Step 4: フロントエンド — LAMAvatar移植・改修
 1. LAM_gpro から4ファイルを移植
-   - `src/components/LAMAvatar.astro`
-   - `src/scripts/lam/audio-sync-player.ts`
-   - `src/scripts/lam/lam-websocket-manager.ts`
-   - `public/avatar/concierge.zip`
-2. `npm install gaussian-splat-renderer-for-lam`
+2. `LAMAvatar.astro` を `LiveAudioManager` 連携に改修
+3. `npm install gaussian-splat-renderer-for-lam`
 
-### Step 3: Concierge.astro 修正
-1. LAMAvatarコンポーネントの埋め込み
-2. CSS調整（canvasサイズ、レスポンシブ対応）
+### Step 5: フロントエンド — コントローラー修正
+1. `core-controller.ts` に `live_expression` イベント受信を追加
+2. `concierge-controller.ts` に `linkLamAvatar()` を追加
+3. CSSアニメーション関連コードを削除
+4. `Concierge.astro` にLAMAvatarを埋め込み
 
-### Step 4: concierge-controller.ts 修正
-1. `linkLamAvatar()` の追加（init時）
-2. `speakTextGCP()` の書き換え（expression適用）
-3. `applyExpressionFromTts()` の追加
-4. `speakResponseInChunks()` の修正
-5. ショップ紹介TTS部分の修正
-6. `stopAvatarAnimation()` の修正
-7. `session_id` の送信追加
-
-### Step 5: テスト・検証
+### Step 6: テスト・検証
 1. ローカルでGaussian Splatモデルのロード確認
-2. TTS + expression同期再生の確認
-3. フェードイン/アウトの動作確認
-4. WebGL非対応時のフォールバック確認
-5. モバイル端末でのパフォーマンス確認
+2. LiveAPI音声 + expression同期の確認
+3. ショップ説明時のリップシンク確認
+4. 割り込み（interrupted）時のリセット確認
+5. 再接続時の状態リセット確認
+6. モバイル端末でのパフォーマンス確認
 
 ---
 
-## 8. 検証チェックリスト
+## 11. 検証チェックリスト
 
-### 8.1 バックエンド
-- [ ] audio2exp-service が Cloud Run にデプロイされている
-- [ ] `/health` エンドポイントが200を返す
-- [ ] support-base の `/health` で audio2exp が "connected" と報告される
-- [ ] `/api/tts/synthesize` のレスポンスに `expression` フィールドが含まれる
-- [ ] `expression.names` が52要素の配列（ARKit blendshape名）
-- [ ] `expression.frames` が適切なフレーム数を含む
-- [ ] `expression.frame_rate` が30（または設定値）
+### 11.1 バックエンド
+- [ ] audio2exp-service がPCM入力（24kHz 16bit mono）を受け付ける
+- [ ] `live_api_handler.py` でPCMチャンクがバッファリングされる
+- [ ] バッファ閾値到達時にA2Eサービスに送信される
+- [ ] `live_expression` Socket.IOイベントが正しく送信される
+- [ ] ターン完了時にバッファがフラッシュされる
+- [ ] A2E送信が音声再生をブロックしない（非同期処理）
 
-### 8.2 フロントエンド
+### 11.2 フロントエンド
 - [ ] Gaussian Splatモデル（`concierge.zip`）が正常にロードされる
 - [ ] 3Dアバターが表示される（WebGL対応ブラウザ）
 - [ ] WebGL非対応時に2Dフォールバック画像が表示される
-- [ ] TTS再生時にリップシンクが動作する
+- [ ] `live_expression` イベント受信でexpressionフレームがバッファされる
+- [ ] `AudioContext.currentTime` ベースの同期が正しく動作する
+- [ ] LiveAPI音声再生中にリップシンクが動作する
 - [ ] 音声とリップシンクが同期している（目視確認）
-- [ ] フェードイン/アウトが滑らかに動作する
-- [ ] 音声停止時にアバターが静止状態に戻る
-- [ ] ショップ紹介セリフでもリップシンクが動作する
-- [ ] 並行TTS処理（speakResponseInChunks）でもリップシンクが動作する
-- [ ] モバイルでGaussian Splatが表示される（パフォーマンス許容範囲）
+- [ ] 割り込み（interrupted）時にアバターが静止状態に戻る
+- [ ] ターン完了時に正しくリセットされる
+- [ ] ショップ説明時のリップシンクが動作する
 
-### 8.3 デプロイ
-- [ ] `audio2exp-service/` への変更で自動デプロイが発動する
-- [ ] `support-base/` のデプロイに `AUDIO2EXP_SERVICE_URL` が含まれる
+### 11.3 デプロイ
+- [ ] audio2exp-service の自動デプロイが動作する
 - [ ] min-instances=1 によりコールドスタートが回避されている
+- [ ] support-base の `AUDIO2EXP_SERVICE_URL` が設定されている
 
 ---
 
-## 9. 既知の制限事項・今後の課題
+## 12. 既知の制限事項
 
-### 9.1 LiveAPI音声ストリーミング対応（未対応）
-- 現在LiveAPIの音声出力は短いPCMチャンク（300ms @ 24kHz）
-- A2Eに十分な長さの音声を送るには、チャンクのバッファリングが必要
-- `audio-sync-player.ts` がこのユースケースの基盤として将来利用可能
-- **フェーズ3の課題として保留**
+### 12.1 A2Eレイテンシ
+- バッファリング（0.5秒）+ A2E推論（0.5-1秒）= 最大1.5秒の遅延
+- expressionフレームは音声より遅れて到着するため、初回発話の最初の1-2秒はリップシンクなし
+- **対策：** バッファ閾値を調整可能にする（短くすれば遅延減、A2E精度低下のトレードオフ）
 
-### 9.2 Gaussian Splatのパフォーマンス
+### 12.2 Gaussian Splatのパフォーマンス
 - WebGLが必要（非対応ブラウザではフォールバック画像）
 - モバイル端末ではGPU負荷が高い可能性
-- モデルサイズ 4.09MB のダウンロードがある（初回ロード）
+- モデルサイズ 4.09MB のダウンロード（初回ロード）
 
-### 9.3 TTS応答のレイテンシ
-- A2E処理がTTSレスポンスに加算（通常0.5-2秒）
-- support-base の `min-instances=1`、audio2exp の `min-instances=1` でコールドスタート回避済み
-- 並行TTS処理で体感レイテンシを最小化
+### 12.3 A2Eサービスの同時接続
+- `max-instances=3` で3セッション同時対応
+- 超過時はA2Eのみ失敗（音声再生は影響なし、リップシンクだけ無効化）
 
 ---
 
-## 10. ファイル変更サマリ
+## 13. ファイル変更サマリ
 
-| ファイル | アクション | 変更規模 |
-|---------|----------|---------|
-| `audio2exp-service/*` | 新規移植 | ディレクトリごとコピー |
-| `.github/workflows/deploy-audio2exp.yml` | 新規作成 | ~60行 |
-| `.github/workflows/deploy-cloud-run.yml` | 修正 | 1行追加 |
-| `src/components/LAMAvatar.astro` | 新規移植 | ~500行 |
-| `src/scripts/lam/audio-sync-player.ts` | 新規移植 | ~220行 |
-| `src/scripts/lam/lam-websocket-manager.ts` | 新規移植 | ~400行 |
-| `public/avatar/concierge.zip` | 新規追加 | 4.09MB |
-| `src/components/Concierge.astro` | 修正 | ~10行変更 |
-| `src/scripts/chat/concierge-controller.ts` | 修正 | ~100行変更 |
-| `src/scripts/chat/core-controller.ts` | 修正 | ~5行（session_id追加） |
-| `package.json` | 修正 | 依存追加 |
+| ファイル | アクション | 変更規模 | 重要度 |
+|---------|----------|---------|--------|
+| `support-base/live_api_handler.py` | **修正** | ~80行追加 | ★★★ |
+| `src/scripts/chat/live-audio-manager.ts` | **修正** | ~60行追加 | ★★★ |
+| `src/components/LAMAvatar.astro` | **新規移植+改修** | ~500行（移植）+ 改修 | ★★ |
+| `src/scripts/chat/core-controller.ts` | **修正** | ~10行追加 | ★★ |
+| `src/scripts/chat/concierge-controller.ts` | **修正** | ~30行変更 | ★★ |
+| `src/components/Concierge.astro` | **修正** | ~10行変更 | ★ |
+| `audio2exp-service/*` | **新規移植** | ディレクトリごとコピー | ★ |
+| `.github/workflows/deploy-audio2exp.yml` | **新規作成** | ~50行 | ★ |
+| `src/scripts/lam/audio-sync-player.ts` | **新規移植** | ~220行（参考用） | - |
+| `src/scripts/lam/lam-websocket-manager.ts` | **新規移植** | ~400行（ARKit定数利用） | - |
+| `public/avatar/concierge.zip` | **新規追加** | 4.09MB | ★ |
+| `package.json` | **修正** | 依存追加 | ★ |
