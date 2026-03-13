@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# deploy: revert to 78ecfa2
 """
 Gemini LiveAPI ハンドラ（WebSocket プロキシ）
 stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
