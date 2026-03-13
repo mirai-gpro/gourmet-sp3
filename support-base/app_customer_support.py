@@ -780,7 +780,7 @@ def handle_live_start(data):
     system_prompt = build_system_instruction(mode, user_profile=user_profile)
 
     # ショップ検索コールバック（v5 §5.5: SupportAssistant経由でデータ取得）
-    def shop_search_callback(user_request, lang, search_mode):
+    def shop_search_callback(user_request, lang, search_mode, conversation_history=None):
         """LiveAPIからのfunction calling時にショップデータを取得する"""
         try:
             session = SupportSession(session_id)
@@ -790,6 +790,11 @@ def handle_live_start(data):
                 return None
             session.update_language(lang)
             session.update_mode(search_mode)
+            # LiveAPI会話履歴をSupportSessionに同期（§4.2: REST APIに文脈を提供）
+            if conversation_history:
+                for h in conversation_history:
+                    role = 'user' if h['role'] == 'user' else 'model'
+                    session.add_message(role, h['text'], 'chat')
             session.add_message('user', user_request, 'chat')
             assistant = SupportAssistant(session, SYSTEM_PROMPTS)
             result = assistant.process_user_message(user_request, 'conversation')
