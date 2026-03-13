@@ -288,6 +288,7 @@ class LiveAPISession:
         self.ai_char_count = 0
         self.needs_reconnect = False
         self.session_count = 0
+        self.greeting_sent = False
 
         # 再接続時のトリガーメッセージ（§7.1）
         self._resume_message = None
@@ -396,8 +397,9 @@ class LiveAPISession:
                         config=config
                     ) as session:
 
-                        if self.session_count == 1:
+                        if not self.greeting_sent:
                             # 初回接続: ダミーメッセージで初期あいさつを発火
+                            self.greeting_sent = True
                             self._is_initial_greeting_phase = True
                             trigger_msgs = self.INITIAL_GREETING_TRIGGERS
                             mode_msgs = trigger_msgs.get(self.mode, trigger_msgs['chat'])

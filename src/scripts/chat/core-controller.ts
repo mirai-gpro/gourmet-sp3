@@ -411,12 +411,8 @@ export class CoreController {
       this.els.speakerBtn.classList.remove('disabled');
       this.els.reservationBtn.classList.remove('visible');
 
-      // 3. ★ LiveAPIで初期挨拶を開始（仕様書02 セクション4.4.2）
-      //    REST API挨拶 + GCP TTS の処理は全て削除
-      await this.startLiveMode();
-      // ★ FIX: マイクON状態をUIに反映
-      this.isRecording = true;
-      this.els.micBtn.classList.add('recording');
+      // 3. ★ LiveAPI起動は初回マイクボタンクリック時に行う（iOS getUserMedia制約対策）
+      //    initializeSession()はRESTセッションID取得のみ
 
     } catch (e) {
       console.error('[Session] Initialization error:', e);
