@@ -35,7 +35,12 @@ genai_legacy.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai_legacy.GenerativeModel('gemini-2.5-flash')
 
 # Claude クライアント初期化（ショップ検索・会話メイン処理用）
-claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+if _anthropic_key:
+    claude_client = anthropic.Anthropic(api_key=_anthropic_key)
+else:
+    logger.warning("[Claude] ANTHROPIC_API_KEY が未設定です。Claude APIは利用できません。")
+    claude_client = None
 
 # ========================================
 # RAMベースのセッション管理 (Firestore完全廃止)
@@ -593,6 +598,9 @@ class SupportAssistant:
             logger.info("[Assistant] フォローアップ質問モード: 店舗情報をシステムプロンプトに追加")
 
         try:
+            if not claude_client:
+                raise RuntimeError("ANTHROPIC_API_KEY が未設定のため Claude API を利用できません")
+
             # 会話履歴をClaude形式に変換
             claude_messages = self._convert_history_for_claude(history)
             logger.info(f"[Assistant] Claude API呼び出し開始: 履歴={len(claude_messages)}件")
