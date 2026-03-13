@@ -2,9 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# pydub が ffmpeg を必要とする
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "app.py"]
+EXPOSE 8080
+
+CMD exec gunicorn --bind :${PORT:-8080} --workers 1 --threads 4 --timeout 60 app:app

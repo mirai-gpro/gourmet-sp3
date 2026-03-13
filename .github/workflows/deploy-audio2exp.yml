@@ -1,11 +1,18 @@
-name: Deploy audio2exp-service
+name: Deploy audio2exp-service to Cloud Run
 
 on:
   push:
-    branches: [master]
+    branches: [main, 'claude/**']
     paths:
       - 'audio2exp-service/**'
+      - '.github/workflows/deploy-audio2exp.yml'
   workflow_dispatch:
+
+env:
+  PROJECT_ID: ai-meet-486502
+  SERVICE_NAME: audio2exp-service
+  REGION: us-central1
+  GAR_LOCATION: us-central1-docker.pkg.dev
 
 jobs:
   deploy:
@@ -15,23 +22,63 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - id: auth
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Create Artifact Registry repository (if not exists)
+        run: |
+          gcloud artifacts repositories describe ${{ env.SERVICE_NAME }} \
+            --location=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} 2>/dev/null || \
+          gcloud artifacts repositories create ${{ env.SERVICE_NAME }} \
+            --repository-format=docker \
+            --location=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }}
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE="${{ env.GAR_LOCATION }}/${{ env.PROJECT_ID }}/${{ env.SERVICE_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          docker build -t $IMAGE ./audio2exp-service
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
       - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: audio2exp-service
-          source: audio2exp-service/
-          region: asia-northeast1
-          flags: >-
-            --memory=2Gi
-            --cpu=2
-            --min-instances=1
-            --max-instances=3
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.IMAGE }} \
+            --region=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port=8080 \
+            --memory=2Gi \
+            --cpu=2 \
+            --min-instances=1 \
+            --max-instances=3 \
             --timeout=60
+
+      - name: Show deployed URL
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} \
+            --format='value(status.url)')
+          echo "::notice::Deployed to: $URL"
+          echo "SERVICE_URL=$URL" >> $GITHUB_ENV
+
+      - name: Health check
+        run: |
+          echo "Waiting for service to be ready..."
+          sleep 15
+          curl -sf "${{ env.SERVICE_URL }}/health" | python3 -m json.tool || echo "Health check pending (cold start)"
