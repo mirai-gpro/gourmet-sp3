@@ -20,17 +20,12 @@ gunicorn==21.2.0
 # HTTP Client & Utilities
 httpx>=0.25.0
 requests>=2.31.0
-aiohttp>=3.9.0
 
 # Text Encoding Fix (文字化け修正)
 ftfy>=6.1.0
 
 # Long-term Memory (Supabase)
 supabase>=2.0.0
-
-# Audio resampling (24kHz→16kHz for A2E)
-scipy>=1.11.0
-numpy>=1.24.0
 
 # （将来用：残していても問題なし）
 anthropic>=0.25.0

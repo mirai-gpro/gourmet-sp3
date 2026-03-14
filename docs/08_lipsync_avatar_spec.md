@@ -1,4 +1,4 @@
-# 08: リップシンク・アバター実装仕様書（F2.1）
+# 08: リップシンク・アバター実装仕様書（フェーズ2）
 
 ## 1. 概要
 
@@ -15,17 +15,20 @@
 | 音声転送 | Socket.IO `live_audio` イベント（base64 PCM） |
 | 音声再生 | `LiveAudioManager` — Web Audio API (`AudioBufferSourceNode` キュー) |
 | HTML `<audio>` | **使用しない**（`ttsPlayer` は廃止済み） |
-| A2E統合（REST TTS用） | `app_customer_support.py` L129-161 に既存（MP3入力、同期式） |
+| A2E統合 | `app_customer_support.py` L129-161 に既存（REST TTS用のみ） |
+
+**したがって、フェーズ2のメイン課題は：**
+1. バックエンド：LiveAPI PCMチャンクをA2Eサービスに送信し、expressionフレームをSocket.IOで転送
+2. フロントエンド：Web Audio API再生キューとexpressionフレームの同期（`AudioContext.currentTime` ベース）
 
 ### 1.3 実証テスト済みコンポーネント
-
 | コンポーネント | 実証元 | 状態 |
 |------------|--------|------|
-| Audio2Expression サービス | `C:\Users\hamad\audio2exp-service`（ローカルメンテ・デプロイ、GitHub不要） | デプロイ済み・動作確認済み |
-| support-base A2E統合（REST TTS用） | `app_customer_support.py` L129-161, L543-564 | 実装済み・A2Eリップシンク対応済 |
-| LAMAvatar コンポーネント | [`LAM_gpro`](https://github.com/mirai-gpro/LAM_gpro/tree/claude/update-lam-modelscope-UQKxj/gourmet-sp) | 実証テスト済み |
-| audio-sync-player | 同上 | 実証テスト済み（★本フェーズで活用） |
-| lam-websocket-manager | 同上 | 実証テスト済み |
+| Audio2Expression サービス | `C:\Users\hamad\audio2exp-service` | デプロイ済み・動作確認済み |
+| support-base A2E統合（REST TTS用） | `app_customer_support.py` L129-161, L543-564 | 実装済み |
+| LAMAvatar コンポーネント | `LAM_gpro` リポジトリ | 実証テスト済み |
+| audio-sync-player | `LAM_gpro` リポジトリ | 実証テスト済み（★本フェーズで活用） |
+| lam-websocket-manager | `LAM_gpro` リポジトリ | 実証テスト済み |
 | Gaussian Splatモデル | `concierge.zip` (4.09MB) | 作成済み |
 
 ### 1.4 対象ファイル
@@ -48,38 +51,17 @@ src/scripts/chat/concierge-controller.ts    → LAMAvatar連携
 src/components/Concierge.astro              → アバターステージをLAMAvatar埋め込みに変更
 ```
 
-### 1.5 本フェーズのメイン課題
-
-1. **バックエンド：** LiveAPI PCMチャンクを24kHz→16kHzリサンプリングしてA2Eサービスに送信し、expressionフレームをSocket.IOで転送
-2. **フロントエンド：** Web Audio API再生キューとexpressionフレームの同期（`AudioContext.currentTime` ベース）
+#### バックエンド（デプロイ関連）
+```
+audio2exp-service/                          → 新規ディレクトリとして移植
+.github/workflows/deploy-audio2exp.yml      → 新規：自動デプロイ設定
+```
 
 ---
 
 ## 2. アーキテクチャ
 
-### 2.1 音声データフロー（★最重要設計方針）
-
-> **⚠️ MP3変換は絶対に行わない**
->
-> LiveAPIから届く24kHzのLPCM（生データ）を、一度も圧縮せずにそのまま処理する。
-> MP3への変換は「遅延の増加」と「精度の低下」を招く最大の要因である。
-
-| 処理ステップ | データ形式 | サンプリングレート | 役割 |
-|------------|----------|----------------|------|
-| 1. LiveAPI出力 | LPCM (Base64) | 24,000 Hz | Geminiの生の声 |
-| 2. ブラウザ再生 | LPCM (Binary) | 24,000 Hz | Web Audio APIで再生 |
-| 3. リサンプリング | LPCM (Binary) | 16,000 Hz | A2E(LAM)の要求仕様に適合 |
-| 4. A2E入力 | LPCM (Tensor/Array) | 16,000 Hz | 表情パラメータの生成 |
-
-**「再生は再生（24kHz PCM）」、「アバターはアバター（16kHz PCM）」** — LiveAPIの出力を2つのPCMストリームとして扱うのが、リップシンクを最も美しく、遅延なく動作させる正しい仕様。
-
-#### なぜMP3ではなくLPCMリサンプリングなのか
-
-1. **A2Eモデル特性:** A2E（LAM）の音声特徴抽出器（HuBERT等）は16kHzのLPCMを前提に学習されている。MP3圧縮ノイズは口の動きの滑らかさを損なう
-2. **遅延（レイテンシ）:** MP3エンコードにはフレームの蓄積が必要で数十ミリ秒の遅延が必ず発生。LPCMリサンプリングなら1サンプル単位で処理可能、遅延ほぼゼロ
-3. **実装の単純化:** LiveAPIから届くデータはすでにPCM。MP3にパックしてA2E側でデコードしてPCMに戻すのは計算リソースの無駄
-
-### 2.2 全体データフロー図
+### 2.1 全体データフロー
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -115,26 +97,18 @@ src/components/Concierge.astro              → アバターステージをLAMAv
 │  │                    │                │                     │
 │  │                    │ PCMチャンク受信  │                     │
 │  │                    ▼                │                     │
-│  │         ┌──────────────────┐        │                     │
-│  │         │ 分岐（直列）      │        │                     │
-│  │         │ ① emit(live_audio) → ブラウザ再生（24kHz）        │
-│  │         │ ② A2Eバッファ蓄積 │        │                     │
-│  │         └────────┬─────────┘        │                     │
-│  │                  │                  │                     │
-│  │         句読点検出 or turn_complete   │                     │
-│  │                  │                  │                     │
-│  │         ┌────────▼─────────┐        │                     │
-│  │         │ 24kHz→16kHz      │        │                     │
-│  │         │ リサンプリング     │        │                     │
-│  │         │ (scipy.signal)   │        │                     │
-│  │         └────────┬─────────┘        │                     │
-│  │                  │                  │                     │
-│  │         ┌────────▼─────────┐        │                     │
-│  │         │ A2Eサービスに送信 │        │                     │
-│  │         │ (16kHz PCM)      │        │                     │
-│  │         └────────┬─────────┘        │                     │
-│  │                  │                  │                     │
-│  │         emit('live_expression')     │                     │
+│  │              A2Eバッファ            │                     │
+│  │              (PCMチャンク蓄積)       │                     │
+│  │                    │                │                     │
+│  │          ┌─────────▼──────────┐     │                     │
+│  │          │ 十分な長さに達したら │     │                     │
+│  │          │ A2Eサービスに送信   │     │                     │
+│  │          └─────────┬──────────┘     │                     │
+│  │                    │                │                     │
+│  │          ┌─────────▼──────────┐     │                     │
+│  │          │ emit('live_audio') │     │                     │
+│  │          │ emit('live_expression') │  │                     │
+│  │          └────────────────────┘     │                     │
 │  └─────────────────────────────────────┘                     │
 │                    │                                         │
 └────────────────────┼─────────────────────────────────────────┘
@@ -142,9 +116,8 @@ src/components/Concierge.astro              → アバターステージをLAMAv
                      ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ audio2exp-service（Cloud Run / 別サービス）                     │
-│ ※ローカルでメンテ・デプロイ（GitHubリポジトリには含めない）          │
 │                                                              │
-│  入力: PCM 16kHz 16bit mono (base64)                          │
+│  入力: PCM audio (base64) or MP3                              │
 │  処理: Audio → ARKit 52 Blendshape Expression                 │
 │  出力: { names: string[52],                                   │
 │         frames: [{weights: float[52]}],                      │
@@ -152,7 +125,7 @@ src/components/Concierge.astro              → アバターステージをLAMAv
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 同期メカニズム（LiveAPI PCMストリーミング）
+### 2.2 同期メカニズム（LiveAPI PCMストリーミング）
 
 **課題：** LiveAPIの音声はPCMチャンクとして非同期に到着する。HTML `<audio>` の `currentTime` は使えない。
 
@@ -207,7 +180,7 @@ Expression到着:   [expr_batch_1]        [expr_batch_2]
   推奨: output_transcription ベースの文節検出 → フォールバックとしてターン単位
 ```
 
-### 2.4 LAM_gpro の audio-sync-player.ts の活用
+### 2.3 LAM_gpro の audio-sync-player.ts の活用
 
 LAM_gpro の `AudioSyncPlayer` はまさにこのユースケースのために設計されている：
 
@@ -347,49 +320,16 @@ def _flush_a2e_buffer(self):
     asyncio.create_task(
         self._send_to_a2e(buffer_copy, chunk_index)
     )
-```
 
-### 3.4 24kHz→16kHz リサンプリング＋A2E送信メソッド（新規）
-
-> **★ F2.0からの最重要修正点：**
-> MP3変換は行わない。24kHz PCMを16kHzにリサンプリングしてA2Eに直接渡す。
-
-```python
-import numpy as np
-from scipy import signal
-
-def _resample_24k_to_16k(self, pcm_24k_bytes: bytes) -> bytes:
+async def _send_to_a2e(self, pcm_bytes: bytes, chunk_index: int):
     """
-    24kHz 16bit mono PCM → 16kHz 16bit mono PCM にリサンプリング
-
-    【なぜリサンプリングが必要か】
-    A2E（LAM）の内部で使われているHuBERT等の音声特徴抽出器は、
-    16kHzのLPCMを前提に学習されている。
-    24kHz:16kHz = 3:2 の比率で高速ダウンサンプリングを行う。
-    """
-    # バイト列をnumpy配列(float32)に変換
-    audio_fp32 = np.frombuffer(pcm_24k_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-    # 24kHzから16kHzへリサンプリング (24:16 = 3:2)
-    # resample_polyは高速でストリーミング向き
-    audio_16k = signal.resample_poly(audio_fp32, 2, 3)
-
-    # float32 → int16 に戻す（A2Eの入力フォーマット）
-    audio_16k_int16 = (audio_16k * 32768.0).clip(-32768, 32767).astype(np.int16)
-
-    return audio_16k_int16.tobytes()
-
-async def _send_to_a2e(self, pcm_24k_bytes: bytes, chunk_index: int):
-    """
-    バッファされた24kHz PCMを16kHzにリサンプリングし、
-    A2Eサービスに送信してexpressionフレームをブラウザに転送
+    A2EサービスにバッファされたPCMを送信し、
+    expressionフレームをブラウザに転送
     """
     try:
-        # ★ 24kHz → 16kHz リサンプリング（MP3変換は行わない）
-        pcm_16k_bytes = self._resample_24k_to_16k(pcm_24k_bytes)
-        audio_b64 = base64.b64encode(pcm_16k_bytes).decode('utf-8')
+        audio_b64 = base64.b64encode(pcm_bytes).decode('utf-8')
 
-        # A2Eサービスに送信（PCM 16kHz 16bit mono）
+        # A2Eサービスに送信（PCM 24kHz 16bit monoをそのまま）
         import aiohttp
         async with aiohttp.ClientSession() as http:
             async with http.post(
@@ -397,7 +337,7 @@ async def _send_to_a2e(self, pcm_24k_bytes: bytes, chunk_index: int):
                 json={
                     "audio_base64": audio_b64,
                     "session_id": self.session_id,
-                    "audio_format": "pcm_16000_16bit_mono",
+                    "audio_format": "pcm_24000_16bit_mono",
                     "is_start": chunk_index == 0,
                     "is_final": False,
                 },
@@ -423,7 +363,7 @@ async def _send_to_a2e(self, pcm_24k_bytes: bytes, chunk_index: int):
         logger.warning(f"[A2E] ストリーミング送信エラー: {e}")
 ```
 
-### 3.5 ターン完了時のバッファフラッシュ
+### 3.4 ターン完了時のバッファフラッシュ
 
 ```python
 def _process_turn_complete(self):
@@ -447,7 +387,7 @@ def _process_turn_complete(self):
     self._a2e_chunk_index = 0
 ```
 
-### 3.6 ショップ説明時の対応
+### 3.5 ショップ説明時の対応
 
 `_receive_shop_description()` でも同じ `_buffer_for_a2e()` を呼び出す：
 
@@ -470,29 +410,19 @@ async def _receive_shop_description(self, session, shop_number: int):
                     await self._buffer_for_a2e(audio_bytes)
 ```
 
-### 3.7 A2Eサービスの入力形式拡張
+### 3.6 A2Eサービスの入力形式拡張
 
-> **★ F2.0からの修正：MP3入力拡張ではなく、16kHz PCM入力を新設する**
-
-audio2exp-serviceで `audio_format: "pcm_16000_16bit_mono"` を受け付けるよう拡張する。
-**24kHz→16kHzのリサンプリングはsupport-base側で行う**（セクション3.4参照）ため、A2Eサービスは16kHz PCMを直接受け取るだけでよい。
+現在の `get_expression_frames()` はMP3入力を想定している。LiveAPIのPCM入力に対応するため、audio2exp-serviceで `audio_format: "pcm_24000_16bit_mono"` を受け付けるよう拡張する。
 
 ```python
 # audio2exp-service/app.py に追加
-# 既存のMP3入力に加えて、16kHz PCM入力も受け付ける
-if audio_format == "pcm_16000_16bit_mono":
-    # 16kHz PCMを直接処理（変換不要、A2Eモデルの入力仕様と一致）
+# 既存のMP3入力に加えて、PCM入力も受け付ける
+if audio_format == "pcm_24000_16bit_mono":
+    # PCMを直接処理（pydub変換不要）
     audio_data = base64.b64decode(audio_base64)
+    # 24kHz 16bit mono PCM → numpy array
     samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-    # samples は 16kHz float32 → そのままA2E推論処理へ
-```
-
-### 3.8 support-base の依存追加
-
-```
-# support-base/requirements.txt に追加
-numpy
-scipy
+    # ... A2E推論処理 ...
 ```
 
 ---
@@ -662,7 +592,7 @@ this.socket.on('live_expression', (data: any) => {
 
 **2つの方法：**
 
-#### 方法A: LAMAvatarのgetExpressionData()をLiveAudioManager対応に改修（推奨）
+#### 方法A: LAMAvatarのgetExpressionData()をLiveAudioManager対応に改修
 
 ```typescript
 // LAMAvatar.astro 内
@@ -805,25 +735,88 @@ protected stopAllActivities() {
 
 ---
 
-## 8. audio2exp-service のデプロイ（GitHubリポジトリ外）
+## 8. audio2exp-service の移植とデプロイ
 
-> **⚠️ audio2exp-service は `C:\Users\hamad\audio2exp-service` でローカルメンテナンス・デプロイする。**
-> **gourmet-sp3のGitHubリポジトリには含めない。**
-
-### 8.1 必要な修正（ローカルで実施）
-
-`audio2exp-service/app.py` に `audio_format: "pcm_16000_16bit_mono"` 対応を追加する（セクション3.7参照）。
-
-### 8.2 support-base側の設定
+### 8.1 ディレクトリ構成
 
 ```
-# 環境変数（Cloud Run / .env）
-AUDIO2EXP_SERVICE_URL=https://audio2exp-service-xxxxx.run.app
+gourmet-sp3/
+├── audio2exp-service/              ← C:\Users\hamad\audio2exp-service から移植
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── app.py                      ← メインFlaskアプリ
+│   ├── audio2expression.py         ← A2Eコア処理
+│   ├── models/                     ← 推論モデルファイル
+│   └── ...
+└── .github/workflows/
+    ├── deploy-cloud-run.yml        ← 既存（support-base用）+ AUDIO2EXP_SERVICE_URL追加
+    └── deploy-audio2exp.yml        ← 新規（audio2exp-service用）
 ```
 
-### 8.3 deploy-audio2exp.yml（GitHub Actions）
+### 8.2 GitHub Actions：deploy-audio2exp.yml
 
-audio2exp-serviceはローカルメンテのためGitHub Actionsは不要。ローカルから直接Cloud Runにデプロイする。
+```yaml
+name: Deploy Audio2Exp to Cloud Run
+
+on:
+  push:
+    branches: [main, 'claude/**']
+    paths:
+      - 'audio2exp-service/**'
+      - '.github/workflows/deploy-audio2exp.yml'
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ai-meet-486502
+  SERVICE_NAME: audio2exp-service
+  REGION: us-central1
+  GAR_LOCATION: us-central1-docker.pkg.dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE="${{ env.GAR_LOCATION }}/${{ env.PROJECT_ID }}/${{ env.SERVICE_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          docker build -t $IMAGE ./audio2exp-service
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.IMAGE }} \
+            --region=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port=8080 \
+            --memory=2Gi \
+            --cpu=2 \
+            --min-instances=1 \
+            --max-instances=3 \
+            --timeout=60
+```
+
+### 8.3 PCM入力対応の拡張
+
+`audio2exp-service` に `audio_format: "pcm_24000_16bit_mono"` を受け付けるよう拡張が必要。
+現在はMP3入力のみ対応のため、PCMの直接処理パスを追加する。
 
 ---
 
@@ -837,20 +830,19 @@ npm install gaussian-splat-renderer-for-lam
 
 ## 10. 実装順序
 
-### Step 1: audio2exp-service に16kHz PCM入力対応を追加（ローカル作業）
-1. `C:\Users\hamad\audio2exp-service` で `audio_format: "pcm_16000_16bit_mono"` 対応を実装
-2. ローカルテストで16kHz PCM入力→表情データ生成を確認
-3. Cloud Runにデプロイ
+### Step 1: audio2exp-service の移植・デプロイ
+1. `C:\Users\hamad\audio2exp-service` を `gourmet-sp3/audio2exp-service/` にコピー
+2. PCM入力対応を追加（`audio_format: "pcm_24000_16bit_mono"`）
+3. `.github/workflows/deploy-audio2exp.yml` を作成
+4. GitHub Secrets に `AUDIO2EXP_SERVICE_URL` を設定
 
 ### Step 2: バックエンド — live_api_handler.py の修正（★最重要）
-1. `numpy` `scipy` を `requirements.txt` に追加
-2. `LiveAPISession` に A2E文節単位バッファリング機構を追加
-3. `_resample_24k_to_16k()` リサンプリング関数を実装
-4. `_receive_and_forward()` に `_buffer_for_a2e()` 呼び出しを追加
-5. `_on_output_transcription()` による句読点検出フラッシュを実装
-6. `_receive_shop_description()` にも同様の追加
-7. ターン完了時のバッファ強制フラッシュを追加
-8. `live_expression` Socket.IOイベントの送信
+1. `LiveAPISession` に A2E文節単位バッファリング機構を追加
+2. `_receive_and_forward()` に `_buffer_for_a2e()` 呼び出しを追加
+3. `_on_output_transcription()` による句読点検出フラッシュを実装
+4. `_receive_shop_description()` にも同様の追加
+5. ターン完了時のバッファ強制フラッシュを追加
+6. `live_expression` Socket.IOイベントの送信
 
 ### Step 3: フロントエンド — LiveAudioManager の拡張（★最重要）
 1. expression同期フィールドの追加
@@ -884,9 +876,8 @@ npm install gaussian-splat-renderer-for-lam
 ## 11. 検証チェックリスト
 
 ### 11.1 バックエンド
-- [ ] audio2exp-service が16kHz PCM入力を受け付ける
-- [ ] `live_api_handler.py` で24kHz→16kHzリサンプリングが正常動作する
-- [ ] PCMチャンクが文節単位でバッファリングされる
+- [ ] audio2exp-service がPCM入力（24kHz 16bit mono）を受け付ける
+- [ ] `live_api_handler.py` でPCMチャンクが文節単位でバッファリングされる
 - [ ] `output_transcription` の句読点（。？！）検出でA2Eバッファがフラッシュされる
 - [ ] 短すぎるバッファ（0.5秒未満）は次の文節と結合される
 - [ ] `live_expression` Socket.IOイベントが正しく送信される
@@ -907,10 +898,9 @@ npm install gaussian-splat-renderer-for-lam
 - [ ] ショップ説明時のリップシンクが動作する
 
 ### 11.3 デプロイ
-- [ ] audio2exp-service が16kHz PCM対応でデプロイ済み
+- [ ] audio2exp-service の自動デプロイが動作する
 - [ ] min-instances=1 によりコールドスタートが回避されている
 - [ ] support-base の `AUDIO2EXP_SERVICE_URL` が設定されている
-- [ ] support-base に `numpy` `scipy` が含まれている
 
 ---
 
@@ -943,29 +933,18 @@ npm install gaussian-splat-renderer-for-lam
 
 ---
 
-## 13. F2.0 からの変更点サマリ
-
-| 項目 | F2.0（旧） | F2.1（本書） |
-|------|----------|------------|
-| A2E入力フォーマット | `pcm_24000_16bit_mono`（24kHz直送）or MP3 | **`pcm_16000_16bit_mono`（16kHzリサンプリング済み）** |
-| リサンプリング | なし or MP3エンコード/デコード | **24kHz→16kHz ダウンサンプリング（scipy.signal.resample_poly）** |
-| MP3変換 | 検討中 | **絶対禁止**（遅延増加・精度低下の原因） |
-| audio2exp-service管理 | GitHubリポジトリに移植+GitHub Actions | **ローカルメンテ・デプロイ（GitHub不要）** |
-| support-base依存追加 | なし | **numpy, scipy** |
-
----
-
-## 14. ファイル変更サマリ
+## 13. ファイル変更サマリ
 
 | ファイル | アクション | 変更規模 | 重要度 |
 |---------|----------|---------|--------|
-| `support-base/live_api_handler.py` | **修正** | ~100行追加（リサンプリング含む） | ★★★ |
-| `support-base/requirements.txt` | **修正** | numpy, scipy 追加 | ★★ |
+| `support-base/live_api_handler.py` | **修正** | ~80行追加 | ★★★ |
 | `src/scripts/chat/live-audio-manager.ts` | **修正** | ~60行追加 | ★★★ |
 | `src/components/LAMAvatar.astro` | **新規移植+改修** | ~500行（移植）+ 改修 | ★★ |
 | `src/scripts/chat/core-controller.ts` | **修正** | ~10行追加 | ★★ |
 | `src/scripts/chat/concierge-controller.ts` | **修正** | ~30行変更 | ★★ |
 | `src/components/Concierge.astro` | **修正** | ~10行変更 | ★ |
+| `audio2exp-service/*` | **新規移植** | ディレクトリごとコピー | ★ |
+| `.github/workflows/deploy-audio2exp.yml` | **新規作成** | ~50行 | ★ |
 | `src/scripts/lam/audio-sync-player.ts` | **新規移植** | ~220行（参考用） | - |
 | `src/scripts/lam/lam-websocket-manager.ts` | **新規移植** | ~400行（ARKit定数利用） | - |
 | `public/avatar/concierge.zip` | **新規追加** | 4.09MB | ★ |

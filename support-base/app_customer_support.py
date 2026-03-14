@@ -1,8 +1,8 @@
+
 # -*- coding: utf-8 -*-
-# deploy: force redeploy at 78ecfa2 state
 """
 汎用カスタマーサポートシステム (Gemini API版) - 改善版
-モジュール分割版(3ファイル構成) + Audio2Expression リップシンク対応
+モジュール分割版(3ファイル構成)
 
 分割構成:
 - api_integrations.py: 外部API連携
