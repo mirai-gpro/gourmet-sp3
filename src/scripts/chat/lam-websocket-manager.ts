@@ -72,7 +72,7 @@ export class LAMWebSocketManager {
             // デフォルト: x=0, y=1.8, z=1
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
-                camera.position.z = 0.55;   // 近づけて顔を大きく
+                camera.position.z = 0.4;    // 近づけて顔を大きく
                 camera.position.y = 1.72;   // 少し下げて顔を上に寄せる
                 camera.updateProjectionMatrix();
                 console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z);
