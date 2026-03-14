@@ -73,9 +73,17 @@ export class LAMWebSocketManager {
             if (this.renderer.viewer && this.renderer.viewer.camera) {
                 const camera = this.renderer.viewer.camera;
                 camera.position.z = 0.4;    // 近づけて顔を大きく
-                camera.position.y = 1.78;   // 顔の下半分が見えるよう上げる
+                camera.position.y = 1.78;   // カメラの高さ
+
+                // 注視点（controls.target）を顔の高さに合わせる
+                const controls = this.renderer.viewer.controls;
+                if (controls) {
+                    controls.target.set(0, 1.75, 0);  // 顔の中心を注視
+                    controls.update();
+                }
+
                 camera.updateProjectionMatrix();
-                console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z);
+                console.log('[LAMWebSocketManager] カメラ位置調整: y=', camera.position.y, 'z=', camera.position.z, 'target.y=', controls?.target?.y);
             }
 
             this.isModelLoaded = true;
