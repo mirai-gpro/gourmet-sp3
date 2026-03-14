@@ -36,20 +36,100 @@
   let renderer: any = null;
   let liveAudioManager: LiveAudioManager | null = null;
 
+  // アイドルアニメーション用の状態
+  let idleStartTime = Date.now();
+  let nextBlinkTime = 0;
+  let blinkPhase = 0; // 0=open, 1=closing, 2=opening
+  let blinkTimer = 0;
+
+  function scheduleNextBlink() {
+    nextBlinkTime = Date.now() + 2000 + Math.random() * 4000; // 2-6秒間隔
+  }
+  scheduleNextBlink();
+
+  /**
+   * アイドル時の自然な表情を生成（まばたき・微妙な動き）
+   */
+  function getIdleExpression(): Record<string, number> {
+    const now = Date.now();
+    const elapsed = (now - idleStartTime) / 1000;
+
+    const expr: Record<string, number> = {};
+
+    // まばたき処理
+    let blinkValue = 0;
+    if (now >= nextBlinkTime && blinkPhase === 0) {
+      blinkPhase = 1;
+      blinkTimer = now;
+    }
+    if (blinkPhase === 1) {
+      const dt = now - blinkTimer;
+      if (dt < 80) {
+        blinkValue = dt / 80;
+      } else {
+        blinkPhase = 2;
+        blinkTimer = now;
+      }
+    } else if (blinkPhase === 2) {
+      const dt = now - blinkTimer;
+      if (dt < 80) {
+        blinkValue = 1 - dt / 80;
+      } else {
+        blinkPhase = 0;
+        blinkValue = 0;
+        scheduleNextBlink();
+      }
+    }
+    expr['eyeBlinkLeft'] = blinkValue;
+    expr['eyeBlinkRight'] = blinkValue;
+
+    // 呼吸による微妙な動き
+    const breathCycle = Math.sin(elapsed * 0.8) * 0.5 + 0.5;
+    expr['jawOpen'] = breathCycle * 0.01;
+
+    // 微妙な眉の動き
+    const browCycle = Math.sin(elapsed * 0.3) * 0.5 + 0.5;
+    expr['browInnerUp'] = browCycle * 0.05;
+
+    // わずかな笑み
+    expr['mouthSmileLeft'] = 0.08 + Math.sin(elapsed * 0.2) * 0.02;
+    expr['mouthSmileRight'] = 0.08 + Math.sin(elapsed * 0.2) * 0.02;
+
+    // 微妙な視線の動き
+    const lookX = Math.sin(elapsed * 0.15) * 0.03;
+    const lookY = Math.sin(elapsed * 0.12) * 0.02;
+    expr['eyeLookInLeft'] = Math.max(0, lookX);
+    expr['eyeLookOutLeft'] = Math.max(0, -lookX);
+    expr['eyeLookInRight'] = Math.max(0, -lookX);
+    expr['eyeLookOutRight'] = Math.max(0, lookX);
+    expr['eyeLookUpLeft'] = Math.max(0, lookY);
+    expr['eyeLookUpRight'] = Math.max(0, lookY);
+    expr['eyeLookDownLeft'] = Math.max(0, -lookY);
+    expr['eyeLookDownRight'] = Math.max(0, -lookY);
+
+    return expr;
+  }
+
   /**
    * 現在のexpressionデータをARKitブレンドシェイプのオブジェクト形式で返す
    * GaussianSplatRenderer の getExpressionData コールバック用
+   * リップシンクデータがない時はアイドルアニメーションを返す
    */
   function getExpressionData(): Record<string, number> | null {
-    if (!liveAudioManager) return null;
-    const frame = liveAudioManager.getCurrentExpressionFrame();
-    if (!frame || !frame.names || !frame.weights) return null;
-
-    const result: Record<string, number> = {};
-    for (let i = 0; i < frame.names.length; i++) {
-      result[frame.names[i]] = frame.weights[i] || 0;
+    // リップシンクデータがあればそれを使う
+    if (liveAudioManager) {
+      const frame = liveAudioManager.getCurrentExpressionFrame();
+      if (frame && frame.names && frame.weights) {
+        const result: Record<string, number> = {};
+        for (let i = 0; i < frame.names.length; i++) {
+          result[frame.names[i]] = frame.weights[i] || 0;
+        }
+        return result;
+      }
     }
-    return result;
+
+    // リップシンクデータがない時はアイドルアニメーション
+    return getIdleExpression();
   }
 
   /**
