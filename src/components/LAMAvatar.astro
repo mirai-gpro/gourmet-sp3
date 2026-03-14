@@ -1,0 +1,233 @@
+---
+// LAMAvatar.astro - Gaussian Splatting 3Dアバターコンポーネント
+// LAM_gpro より移植・改修（仕様書08 セクション6）
+//
+// 【改修ポイント】
+// - 旧: HTML <audio> 要素の currentTime で同期
+// - 新: LiveAudioManager の getCurrentPlaybackOffset() で同期
+// - 公式API: GaussianSplatRenderer.getInstance(div, assetPath, callbacks)
+
+export interface Props {
+  modelUrl?: string;
+}
+
+const {
+  modelUrl = '/avatar/concierge.zip',
+} = Astro.props;
+---
+
+<div class="lam-avatar-wrapper" id="lamAvatarWrapper">
+  <!-- GaussianSplatRenderer がマウントされるdiv -->
+  <div id="lamAvatarContainer" class="lam-avatar-container"></div>
+  <!-- フォールバック: WebGL未対応時にアバター画像を表示 -->
+  <img
+    id="lamAvatarFallback"
+    src="/images/avatar-anime.png"
+    alt="AI Avatar"
+    class="lam-avatar-fallback hidden"
+  />
+  <div id="lamAvatarLoading" class="lam-loading">
+    <div class="lam-spinner"></div>
+    <p>Loading 3D Avatar...</p>
+  </div>
+</div>
+
+<style>
+.lam-avatar-wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: hidden;
+}
+
+.lam-avatar-container {
+  width: 100%;
+  height: 100%;
+}
+
+.lam-avatar-fallback {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 6px rgba(0,0,0,0.2));
+  transition: opacity 0.3s, transform 0.3s;
+}
+
+.lam-avatar-fallback.hidden {
+  display: none;
+}
+
+.lam-avatar-fallback.speaking {
+  animation: breathe 1s infinite alternate ease-in-out;
+  filter: drop-shadow(0 0 15px rgba(6, 182, 212, 0.6));
+}
+
+@keyframes breathe {
+  0% { transform: scale(1); }
+  100% { transform: scale(1.05) translateY(-2px); }
+}
+
+.lam-loading {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  color: #666;
+  font-size: 12px;
+}
+
+.lam-loading.hidden {
+  display: none;
+}
+
+.lam-spinner {
+  width: 30px;
+  height: 30px;
+  border: 3px solid rgba(6, 182, 212, 0.3);
+  border-top-color: #06b6d4;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin: 0 auto 8px;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+</style>
+
+<script define:vars={{ modelUrl }}>
+  window.__lamAvatarConfig = { modelUrl };
+</script>
+
+<script>
+  import { LAMWebSocketManager } from '../scripts/chat/lam-websocket-manager';
+  import { AudioSyncPlayer } from '../scripts/chat/audio-sync-player';
+  import type { LiveAudioManager, ExpressionFrame } from '../scripts/chat/live-audio-manager';
+
+  /**
+   * LAMAvatarController - LAMAvatar コンポーネントの制御クラス
+   *
+   * 仕様書08 セクション6.1, 6.2:
+   * - External TTS Player モードから LiveAudioManager モードへ
+   * - getExpressionData() は LiveAudioManager.getCurrentExpressionFrame() 直接呼び出し
+   * - 公式API: GaussianSplatRenderer.getInstance(div, assetPath, callbacks)
+   */
+  class LAMAvatarController {
+    private lamManager: LAMWebSocketManager;
+    private syncPlayer: AudioSyncPlayer;
+    private containerEl: HTMLDivElement;
+    private fallbackEl: HTMLImageElement;
+    private loadingEl: HTMLElement;
+    private isInitialized: boolean = false;
+    private useFallback: boolean = false;
+
+    constructor() {
+      this.lamManager = new LAMWebSocketManager();
+      this.syncPlayer = new AudioSyncPlayer();
+      this.containerEl = document.getElementById('lamAvatarContainer') as HTMLDivElement;
+      this.fallbackEl = document.getElementById('lamAvatarFallback') as HTMLImageElement;
+      this.loadingEl = document.getElementById('lamAvatarLoading') as HTMLElement;
+    }
+
+    /**
+     * LiveAudioManager をバインドして初期化
+     * ConciergeController.linkLamAvatar() から呼ばれる
+     */
+    async initialize(liveAudioManager: LiveAudioManager): Promise<void> {
+      if (this.isInitialized) return;
+
+      // AudioSyncPlayer に LiveAudioManager をバインド
+      this.syncPlayer.bindLiveAudioManager(liveAudioManager);
+
+      // expression 更新コールバックを設定
+      this.syncPlayer.setExpressionCallback((frame: ExpressionFrame | null) => {
+        this.lamManager.updateExpression(frame);
+      });
+
+      // Gaussian Splat レンダラーを初期化（公式API: getInstance）
+      const config = (window as any).__lamAvatarConfig || {};
+      try {
+        await this.lamManager.initialize({
+          containerElement: this.containerEl,
+          modelUrl: config.modelUrl || '/avatar/concierge.zip',
+        });
+
+        if (this.lamManager.isLoaded()) {
+          this.loadingEl.classList.add('hidden');
+          this.syncPlayer.start();
+          this.isInitialized = true;
+          console.log('[LAMAvatar] 3Dアバター初期化完了');
+        } else {
+          this._showFallback();
+        }
+      } catch (error) {
+        console.error('[LAMAvatar] 初期化エラー:', error);
+        this._showFallback();
+      }
+    }
+
+    /**
+     * フォールバック表示（静止画アバター + CSSアニメーション）
+     */
+    private _showFallback(): void {
+      this.useFallback = true;
+      this.containerEl.style.display = 'none';
+      this.loadingEl.classList.add('hidden');
+      this.fallbackEl.classList.remove('hidden');
+      console.log('[LAMAvatar] フォールバック表示に切り替え');
+    }
+
+    /**
+     * 発話開始時
+     */
+    onSpeakingStart(): void {
+      if (this.useFallback) {
+        this.fallbackEl.classList.add('speaking');
+      } else {
+        this.lamManager.setChatState('Responding');
+      }
+    }
+
+    /**
+     * 発話終了時
+     */
+    onSpeakingEnd(): void {
+      if (this.useFallback) {
+        this.fallbackEl.classList.remove('speaking');
+      } else {
+        this.lamManager.setChatState('Idle');
+      }
+    }
+
+    /**
+     * expression バッファをクリア（割り込み・リセット時）
+     */
+    resetExpression(): void {
+      this.lamManager.resetExpression();
+    }
+
+    /**
+     * ブレンドシェイプ名を設定
+     */
+    setExpressionNames(names: string[]): void {
+      this.lamManager.setExpressionNames(names);
+    }
+
+    /**
+     * クリーンアップ
+     */
+    dispose(): void {
+      this.syncPlayer.dispose();
+      this.lamManager.dispose();
+      this.isInitialized = false;
+    }
+  }
+
+  // グローバルにインスタンスを公開（ConciergeController からアクセス用）
+  (window as any).__lamAvatarController = new LAMAvatarController();
+</script>

@@ -286,6 +286,12 @@ export class CoreController {
       this.liveAudioManager.playPcmAudio(data.data);
     });
 
+    // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
+    this.socket.on('live_expression', (data: any) => {
+      if (!this.isLiveMode) return;
+      this.liveAudioManager.onExpressionReceived(data);
+    });
+
     this.socket.on('user_transcript', (data: any) => {
       if (!this.isLiveMode) return;
       const text = data.text;

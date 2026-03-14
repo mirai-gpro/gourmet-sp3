@@ -1,6 +1,8 @@
 ---
 // Concierge.astro - コンシェルジュモードUI (チャットモードと同様の機能)
+// ★ LAMAvatar コンポーネント追加（仕様書08 セクション6.3）
 import ReservationModal from './ReservationModal.astro';
+import LAMAvatar from './LAMAvatar.astro';
 
 export interface Props {
   apiBaseUrl?: string;
@@ -50,7 +52,8 @@ const { apiBaseUrl = '' } = Astro.props;
 
   <div class="avatar-stage" id="avatarStage">
     <div class="avatar-container">
-      <img id="avatarImage" src="/images/avatar-anime.png" alt="AI Avatar" class="avatar-img" />
+      <!-- ★ LAMAvatar: Gaussian Splatting 3Dアバター（仕様書08 セクション6.3） -->
+      <LAMAvatar modelUrl="/avatar/concierge.zip" />
     </div>
   </div>
 
@@ -124,14 +127,14 @@ const { apiBaseUrl = '' } = Astro.props;
 .language-selector { display: flex; align-items: center; }
 .language-dropdown { padding: 6px 12px; border: 2px solid white; border-radius: 20px; background: rgba(255,255,255,0.95); color: #444; font-size: 13px; font-weight: 600; cursor: pointer; outline: none; }
 
-/* アバターステージ */
+/* アバターステージ - ★ LAMAvatar対応（仕様書08 セクション6.3） */
 .avatar-stage {
   flex-shrink: 0;
-  height: 140px;
+  height: 200px;
   background: #f0f2f5;
   display: flex;
   justify-content: center;
-  align-items: flex-end;
+  align-items: center;
   border-bottom: 1px solid #e0e0e0;
   transition: background 0.5s ease;
   position: relative;
@@ -143,29 +146,14 @@ const { apiBaseUrl = '' } = Astro.props;
 }
 
 .avatar-container {
-  width: 110px;
-  height: 110px;
+  width: 100%;
+  height: 100%;
   position: relative;
   transition: transform 0.3s ease;
   z-index: 10;
-}
-
-.avatar-img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  filter: drop-shadow(0 4px 6px rgba(0,0,0,0.2));
-  transition: opacity 0.3s, transform 0.3s;
-}
-
-.avatar-container.speaking .avatar-img {
-  animation: breathe 1s infinite alternate ease-in-out;
-  filter: drop-shadow(0 0 15px rgba(6, 182, 212, 0.6));
-}
-
-@keyframes breathe {
-  0% { transform: scale(1); }
-  100% { transform: scale(1.05) translateY(-2px); }
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
 /* 音声ステータス */
@@ -274,9 +262,9 @@ input:checked + .slider:before { transform: translateX(20px); }
 
 
 /* モバイル対応 */
-@media (max-width: 768px) { 
-  .avatar-stage { height: 100px; }
-  .avatar-container { width: 80px; height: 80px; }
+@media (max-width: 768px) {
+  .avatar-stage { height: 150px; }
+  .avatar-container { width: 100%; height: 100%; }
   .floating-buttons { bottom: 80px; right: 16px; gap: 8px; } 
   .btn-floating { width: 52px; height: 52px; } 
   .btn-reservation-float { min-width: 100px; height: 52px; padding: 0 16px; font-size: 13px; } 

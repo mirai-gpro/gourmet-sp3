@@ -7,13 +7,15 @@ import { AudioManager } from './audio-manager';
 declare const io: any;
 
 export class ConciergeController extends CoreController {
-  
+  // ★ LAMAvatar コントローラー参照（仕様書08 セクション7.1）
+  private lamAvatarController: any = null;
+
   constructor(container: HTMLElement, apiBase: string) {
     super(container, apiBase);
-    
+
     // ★コンシェルジュモード用のAudioManagerを6.5秒設定で再初期化２
     this.audioManager = new AudioManager(8000);
-    
+
     // コンシェルジュモードに設定
     this.currentMode = 'concierge';
     this.init();
@@ -23,18 +25,37 @@ export class ConciergeController extends CoreController {
   protected async init() {
     // 親クラスの初期化を実行
     await super.init();
-    
+
     // コンシェルジュ固有の要素とイベントを追加
     const query = (sel: string) => this.container.querySelector(sel) as HTMLElement;
     this.els.avatarContainer = query('.avatar-container');
     this.els.avatarImage = query('#avatarImage') as HTMLImageElement;
     this.els.modeSwitch = query('#modeSwitch') as HTMLInputElement;
-    
+
     // モードスイッチのイベントリスナー追加
     if (this.els.modeSwitch) {
       this.els.modeSwitch.addEventListener('change', () => {
         this.toggleMode();
       });
+    }
+
+    // ★ LAMAvatar連携初期化（仕様書08 セクション7.1）
+    this.linkLamAvatar();
+  }
+
+  // ★ LAMAvatarにLiveAudioManagerをバインド（仕様書08 セクション7.1）
+  private async linkLamAvatar(): Promise<void> {
+    const controller = (window as any).__lamAvatarController;
+    if (controller) {
+      this.lamAvatarController = controller;
+      try {
+        await controller.initialize(this.liveAudioManager);
+        console.log('[ConciergeController] LAMAvatar連携完了');
+      } catch (e) {
+        console.error('[ConciergeController] LAMAvatar連携エラー:', e);
+      }
+    } else {
+      console.warn('[ConciergeController] LAMAvatarController が見つかりません');
     }
   }
 
@@ -110,21 +131,26 @@ export class ConciergeController extends CoreController {
   }
 
   // コンシェルジュモード固有: アバターアニメーション制御
+  // ★ リップシンクはLiveAudioManager→A2E→LAMAvatar 自動同期に委譲（仕様書08 セクション7.2）
+  // CSSアニメーション処理はフォールバック用に残す
   protected async speakTextGCP(text: string, stopPrevious: boolean = true, autoRestartMic: boolean = false, skipAudio: boolean = false) {
     if (skipAudio || !this.isTTSEnabled || !text) return Promise.resolve();
 
     if (stopPrevious) {
       this.ttsPlayer.pause();
     }
-    
-    // アバターアニメーションを開始
+
+    // アバターアニメーションを開始（フォールバック用CSSアニメーション + LAMAvatar）
     if (this.els.avatarContainer) {
       this.els.avatarContainer.classList.add('speaking');
     }
-    
+    if (this.lamAvatarController) {
+      this.lamAvatarController.onSpeakingStart();
+    }
+
     // 親クラスのTTS処理を実行
     await super.speakTextGCP(text, stopPrevious, autoRestartMic, skipAudio);
-    
+
     // アバターアニメーションを停止
     this.stopAvatarAnimation();
   }
@@ -133,6 +159,9 @@ export class ConciergeController extends CoreController {
   private stopAvatarAnimation() {
     if (this.els.avatarContainer) {
       this.els.avatarContainer.classList.remove('speaking');
+    }
+    if (this.lamAvatarController) {
+      this.lamAvatarController.onSpeakingEnd();
     }
   }
 
@@ -170,10 +199,14 @@ export class ConciergeController extends CoreController {
     // コンシェルジュモードは既に現在のページなので何もしない
   }
 
-  // すべての活動を停止(アバターアニメーションも含む)
+  // すべての活動を停止(アバターアニメーションも含む)（仕様書08 セクション7.3）
   protected stopAllActivities() {
     super.stopAllActivities();
     this.stopAvatarAnimation();
+    // ★ LAMAvatar フレームバッファクリア
+    if (this.lamAvatarController) {
+      this.lamAvatarController.resetExpression();
+    }
   }
 
   // ========================================

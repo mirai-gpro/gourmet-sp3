@@ -73,7 +73,8 @@ jobs:
             --set-env-vars="HOTPEPPER_API_KEY=${{ secrets.HOTPEPPER_API_KEY }}" \
             --set-env-vars="TRIPADVISOR_API_KEY=${{ secrets.TRIPADVISOR_API_KEY }}" \
             --set-env-vars="SUPABASE_URL=${{ secrets.SUPABASE_URL }}" \
-            --set-env-vars="SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}"
+            --set-env-vars="SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" \
+            --set-env-vars="A2E_SERVICE_URL=${{ secrets.A2E_SERVICE_URL }}"
 
       - name: Show deployed URL
         run: |

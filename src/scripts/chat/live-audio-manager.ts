@@ -41,6 +41,11 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
     return bytes.buffer;
 }
 
+// Expression フレームデータ型
+export interface ExpressionFrame {
+    values: number[];  // ARKit 52 ブレンドシェイプ値
+}
+
 export class LiveAudioManager {
     private audioContext: AudioContext | null = null;
     private mediaStream: MediaStream | null = null;
@@ -55,6 +60,12 @@ export class LiveAudioManager {
     private playbackQueue: AudioBuffer[] = [];
     private isPlaying: boolean = false;
     private nextPlayTime: number = 0;
+
+    // ★ Expression同期機能（仕様書08 セクション4.1）
+    private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
+    private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームデータ
+    public expressionFrameRate: number = 30;           // fps（デフォルト30）
+    public expressionNames: string[] = [];             // ARKit ブレンドシェイプ名
 
     // ========================================
     // セッション開始時に1度だけ呼ぶ
@@ -174,6 +185,11 @@ export class LiveAudioManager {
     playPcmAudio(pcmBase64: string): void {
         if (!this.audioContext) return;
 
+        // ★ 最初のチャンク時にfirstChunkStartTimeを記録（仕様書08 セクション4.2）
+        if (this.firstChunkStartTime === 0) {
+            this.firstChunkStartTime = this.audioContext.currentTime;
+        }
+
         const pcmBytes = base64ToArrayBuffer(pcmBase64);
         // PCM 24kHz 16bit mono → Float32
         const int16 = new Int16Array(pcmBytes);
@@ -212,12 +228,62 @@ export class LiveAudioManager {
     }
 
     // ========================================
+    // ★ Expression同期メソッド（仕様書08 セクション4.1, 4.3）
+    // ========================================
+
+    /**
+     * 現在の再生オフセット（ms）を計算
+     */
+    getCurrentPlaybackOffset(): number {
+        if (!this.audioContext || this.firstChunkStartTime === 0) return 0;
+        return (this.audioContext.currentTime - this.firstChunkStartTime) * 1000;
+    }
+
+    /**
+     * 現在のフレームインデックスからexpressionフレームを取得
+     */
+    getCurrentExpressionFrame(): ExpressionFrame | null {
+        if (this.expressionFrameBuffer.length === 0) return null;
+
+        const offsetMs = this.getCurrentPlaybackOffset();
+        const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
+        const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
+
+        if (clampedIndex < 0) return null;
+        return this.expressionFrameBuffer[clampedIndex];
+    }
+
+    /**
+     * Socket.IO live_expression イベントデータをフレームバッファに追加
+     */
+    onExpressionReceived(data: {
+        expressions: number[][];
+        expression_names: string[];
+        frame_rate: number;
+        chunk_index: number;
+    }): void {
+        // フレームレートとブレンドシェイプ名を更新
+        if (data.frame_rate) this.expressionFrameRate = data.frame_rate;
+        if (data.expression_names && data.expression_names.length > 0) {
+            this.expressionNames = data.expression_names;
+        }
+
+        // フレームデータをバッファに追加
+        for (const values of data.expressions) {
+            this.expressionFrameBuffer.push({ values });
+        }
+    }
+
+    // ========================================
     // 再生キューをクリア（割り込み時）
     // ========================================
     clearPlaybackQueue(): void {
         this.playbackQueue = [];
         this.isPlaying = false;
         this.nextPlayTime = 0;
+        // ★ expressionバッファもクリア
+        this.expressionFrameBuffer = [];
+        this.firstChunkStartTime = 0;
     }
 
     // ========================================
@@ -225,6 +291,9 @@ export class LiveAudioManager {
     // ========================================
     onAiResponseStarted(): void {
         this.isAiSpeaking = true;
+        // ★ expression状態をリセット（仕様書08 セクション4.4）
+        this.firstChunkStartTime = 0;
+        this.expressionFrameBuffer = [];
     }
 
     onAiResponseEnded(): void {

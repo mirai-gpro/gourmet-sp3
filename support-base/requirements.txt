@@ -27,5 +27,9 @@ ftfy>=6.1.0
 # Long-term Memory (Supabase)
 supabase>=2.0.0
 
+# A2E (Audio2Expression) リサンプリング
+scipy>=1.11.0
+numpy>=1.24.0
+
 # （将来用：残していても問題なし）
 anthropic>=0.25.0

@@ -1,0 +1,58 @@
+name: Deploy Audio2Exp Service to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'audio2exp-service/**'
+      - '.github/workflows/deploy-audio2exp.yml'
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: hp-support-477512
+  SERVICE_NAME: audio2exp-service
+  REGION: us-central1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY_A2E }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run (source-based)
+        run: |
+          cd audio2exp-service
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --source . \
+            --project=${{ env.PROJECT_ID }} \
+            --region=${{ env.REGION }} \
+            --memory=8Gi \
+            --cpu=4 \
+            --timeout=300 \
+            --min-instances=1 \
+            --max-instances=3 \
+            --cpu-boost \
+            --set-env-vars="MODEL_DIR=/app/models,DEVICE=cpu,WARMUP_TIMEOUT=0,ENGINE_LOAD_TIMEOUT=1500"
+
+      - name: Health check
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --project=${{ env.PROJECT_ID }} \
+            --format='value(status.url)')
+          echo "::notice::Deployed to: $URL"
+          sleep 10
+          curl -sf "$URL/health" || echo "Health check pending (cold start)"
