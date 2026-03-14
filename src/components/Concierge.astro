@@ -129,7 +129,7 @@ const { apiBaseUrl = '' } = Astro.props;
 /* アバターステージ */
 .avatar-stage {
   flex-shrink: 0;
-  height: 450px;
+  height: 320px;
   background: #f0f2f5;
   display: flex;
   justify-content: center;
@@ -145,11 +145,11 @@ const { apiBaseUrl = '' } = Astro.props;
 }
 
 .avatar-container {
-  width: 220%;
-  height: 220%;
+  width: 160%;
+  height: 160%;
   position: absolute;
-  top: -75%;
-  left: -60%;
+  top: -38%;
+  left: -30%;
   z-index: 10;
 }
 
@@ -279,8 +279,8 @@ input:checked + .slider:before { transform: translateX(20px); }
 
 /* モバイル対応 */
 @media (max-width: 768px) {
-  .avatar-stage { height: 280px; }
-  .avatar-container { width: 220%; height: 220%; top: -75%; left: -60%; }
+  .avatar-stage { height: 220px; }
+  .avatar-container { width: 160%; height: 160%; top: -38%; left: -30%; }
   .floating-buttons { bottom: 80px; right: 16px; gap: 8px; } 
   .btn-floating { width: 52px; height: 52px; } 
   .btn-reservation-float { min-width: 100px; height: 52px; padding: 0 16px; font-size: 13px; } 
