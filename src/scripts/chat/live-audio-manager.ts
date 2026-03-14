@@ -73,6 +73,11 @@ export class LiveAudioManager {
     private expressionFrameRate: number = 30;
     private expressionNames: string[] = [];
 
+    // ★ 音声リアクティブ フォールバック リップシンク（A2Eサービス未接続時）
+    private analyserNode: AnalyserNode | null = null;
+    private analyserData: Uint8Array | null = null;
+    private hasReceivedA2E: boolean = false;
+
     // ========================================
     // セッション開始時に1度だけ呼ぶ
     // ========================================
@@ -207,6 +212,49 @@ export class LiveAudioManager {
         this._processPlaybackQueue();
     }
 
+    private _ensureAnalyser(): AnalyserNode {
+        if (!this.analyserNode && this.audioContext) {
+            this.analyserNode = this.audioContext.createAnalyser();
+            this.analyserNode.fftSize = 256;
+            this.analyserNode.smoothingTimeConstant = 0.3;
+            this.analyserNode.connect(this.audioContext.destination);
+            this.analyserData = new Uint8Array(this.analyserNode.frequencyBinCount);
+        }
+        return this.analyserNode!;
+    }
+
+    /**
+     * 現在の音声ボリュームからフォールバック用のリップシンクExpressionを生成
+     * A2Eサービスからデータが来ない場合に使用
+     */
+    getAudioReactiveFallback(): ExpressionData | null {
+        if (!this.analyserNode || !this.analyserData || !this.isAiSpeaking) return null;
+
+        this.analyserNode.getByteFrequencyData(this.analyserData);
+
+        // 音声帯域（80Hz-4kHz付近）のエネルギーを計算
+        let sum = 0;
+        const start = 2;  // ~80Hz
+        const end = Math.min(40, this.analyserData.length); // ~4kHz
+        for (let i = start; i < end; i++) {
+            sum += this.analyserData[i];
+        }
+        const avg = sum / (end - start);
+        const volume = Math.min(1, avg / 128); // 0-1に正規化
+
+        // 口の開きをボリュームに基づいて生成
+        const jawOpen = volume * 0.7;
+        const mouthOpen = volume * 0.5;
+        const mouthFunnel = volume * 0.2;
+        const mouthLowerDownLeft = volume * 0.3;
+        const mouthLowerDownRight = volume * 0.3;
+
+        return {
+            names: ['jawOpen', 'mouthOpen', 'mouthFunnel', 'mouthLowerDownLeft', 'mouthLowerDownRight', 'mouthSmileLeft', 'mouthSmileRight'],
+            weights: [jawOpen, mouthOpen, mouthFunnel, mouthLowerDownLeft, mouthLowerDownRight, 0.1, 0.1],
+        };
+    }
+
     private _processPlaybackQueue(): void {
         if (this.isPlaying || this.playbackQueue.length === 0 || !this.audioContext) return;
 
@@ -215,7 +263,9 @@ export class LiveAudioManager {
 
         const source = this.audioContext.createBufferSource();
         source.buffer = buffer;
-        source.connect(this.audioContext.destination);
+        // AnalyserNodeを経由して再生（フォールバックリップシンク用）
+        const analyser = this._ensureAnalyser();
+        source.connect(analyser);
 
         const now = this.audioContext.currentTime;
         const startTime = Math.max(now, this.nextPlayTime);
@@ -276,17 +326,20 @@ export class LiveAudioManager {
      * LAMAvatarの60fps描画ループから毎フレーム呼ばれる
      */
     getCurrentExpressionFrame(): ExpressionData | null {
-        if (this.expressionFrameBuffer.length === 0) return null;
         if (!this.isAiSpeaking) return null;
 
-        const offsetMs = this.getCurrentPlaybackOffset();
-        const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
+        // A2Eデータがある場合はそちらを優先
+        if (this.expressionFrameBuffer.length > 0 && this.hasReceivedA2E) {
+            const offsetMs = this.getCurrentPlaybackOffset();
+            const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
 
-        if (frameIndex < 0 || frameIndex >= this.expressionFrameBuffer.length) {
-            return null;
+            if (frameIndex >= 0 && frameIndex < this.expressionFrameBuffer.length) {
+                return this.expressionFrameBuffer[frameIndex];
+            }
         }
 
-        return this.expressionFrameBuffer[frameIndex];
+        // フォールバック: 音声ボリュームベースのリップシンク
+        return this.getAudioReactiveFallback();
     }
 
     /**
@@ -299,6 +352,7 @@ export class LiveAudioManager {
         frames: { weights: number[] }[];
         frame_rate: number;
     }): void {
+        this.hasReceivedA2E = true;
         this.expressionFrameRate = data.frame_rate || 30;
         this.expressionNames = data.names || [];
 
