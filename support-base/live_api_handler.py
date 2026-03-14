@@ -13,6 +13,8 @@ import asyncio
 import base64
 import os
 import logging
+import numpy as np
+from scipy.signal import resample_poly
 import aiohttp
 from google import genai
 from google.genai import types
@@ -1059,7 +1061,10 @@ class LiveAPISession:
     async def _send_to_a2e(self, pcm_bytes: bytes, chunk_index: int):
         """A2EサービスにPCMを送信し、expressionフレームをブラウザに転送"""
         try:
-            audio_b64 = base64.b64encode(pcm_bytes).decode('utf-8')
+            # 24kHz → 16kHz リサンプリング（A2Eは16kHz PCM前提）
+            pcm_24k = np.frombuffer(pcm_bytes, dtype=np.int16)
+            pcm_16k = resample_poly(pcm_24k, 2, 3).astype(np.int16)
+            audio_b64 = base64.b64encode(pcm_16k.tobytes()).decode('utf-8')
 
             if not self._a2e_http_session:
                 self._a2e_http_session = aiohttp.ClientSession()
@@ -1069,7 +1074,7 @@ class LiveAPISession:
                 json={
                     "audio_base64": audio_b64,
                     "session_id": self.session_id,
-                    "audio_format": "pcm_24000_16bit_mono",
+                    "audio_format": "pcm",
                     "is_start": chunk_index == 0,
                     "is_final": False,
                 },
