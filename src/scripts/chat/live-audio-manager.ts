@@ -7,7 +7,17 @@
  * - 半二重制御はフラグ（isAiSpeaking）で行う
  * - VADはGemini側に委譲
  * - AI音声再生もWeb Audio APIで行う（iOS対策）
+ *
+ * ★ フェーズ2拡張: Expression同期機能
+ * - AudioContext.currentTime ベースの再生オフセット追跡
+ * - expressionフレームバッファ管理
+ * - LAMAvatarの描画ループから getCurrentExpressionFrame() で参照
  */
+
+export interface ExpressionData {
+    names: string[];
+    weights: number[];
+}
 
 const b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -55,6 +65,13 @@ export class LiveAudioManager {
     private playbackQueue: AudioBuffer[] = [];
     private isPlaying: boolean = false;
     private nextPlayTime: number = 0;
+
+    // ★ Expression同期用（AudioSyncPlayerから移植）
+    private firstChunkStartTime: number = 0;
+    private isFirstChunk: boolean = true;
+    private expressionFrameBuffer: ExpressionData[] = [];
+    private expressionFrameRate: number = 30;
+    private expressionNames: string[] = [];
 
     // ========================================
     // セッション開始時に1度だけ呼ぶ
@@ -205,6 +222,12 @@ export class LiveAudioManager {
         source.start(startTime);
         this.nextPlayTime = startTime + buffer.duration;
 
+        // ★ 最初のチャンクの再生開始時刻を記録（Expression同期用）
+        if (this.isFirstChunk) {
+            this.firstChunkStartTime = startTime;
+            this.isFirstChunk = false;
+        }
+
         source.onended = () => {
             this.isPlaying = false;
             this._processPlaybackQueue();
@@ -218,6 +241,8 @@ export class LiveAudioManager {
         this.playbackQueue = [];
         this.isPlaying = false;
         this.nextPlayTime = 0;
+        // ★ Expression同期もリセット
+        this._resetExpressionSync();
     }
 
     // ========================================
@@ -229,6 +254,72 @@ export class LiveAudioManager {
 
     onAiResponseEnded(): void {
         this.isAiSpeaking = false;
+        // ★ ターン終了時にExpression同期をリセット（次のターンに備える）
+        this._resetExpressionSync();
+    }
+
+    // ========================================
+    // ★ Expression同期機能（フェーズ2）
+    // ========================================
+
+    /**
+     * 再生開始からの経過時間（ミリ秒）を取得
+     * LAMAvatarの描画ループがexpressionフレームインデックス計算に使用
+     */
+    getCurrentPlaybackOffset(): number {
+        if (!this.audioContext || this.firstChunkStartTime === 0) return 0;
+        return (this.audioContext.currentTime - this.firstChunkStartTime) * 1000;
+    }
+
+    /**
+     * 現在の再生位置に対応するexpressionフレームを取得
+     * LAMAvatarの60fps描画ループから毎フレーム呼ばれる
+     */
+    getCurrentExpressionFrame(): ExpressionData | null {
+        if (this.expressionFrameBuffer.length === 0) return null;
+        if (!this.isAiSpeaking) return null;
+
+        const offsetMs = this.getCurrentPlaybackOffset();
+        const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
+
+        if (frameIndex < 0 || frameIndex >= this.expressionFrameBuffer.length) {
+            return null;
+        }
+
+        return this.expressionFrameBuffer[frameIndex];
+    }
+
+    /**
+     * バックエンドから受信したexpressionフレームをバッファに追加
+     * core-controller.ts の 'live_expression' イベントハンドラから呼ばれる
+     */
+    onExpressionReceived(data: {
+        chunk_index: number;
+        names: string[];
+        frames: { weights: number[] }[];
+        frame_rate: number;
+    }): void {
+        this.expressionFrameRate = data.frame_rate || 30;
+        this.expressionNames = data.names || [];
+
+        for (const frame of data.frames) {
+            this.expressionFrameBuffer.push({
+                names: this.expressionNames,
+                weights: frame.weights,
+            });
+        }
+
+        console.log(`[LiveAudioManager] Expression受信: chunk=${data.chunk_index}, ` +
+            `${data.frames.length}フレーム追加, 合計${this.expressionFrameBuffer.length}フレーム`);
+    }
+
+    /**
+     * Expression同期状態をリセット（ターン完了・割り込み時）
+     */
+    private _resetExpressionSync(): void {
+        this.firstChunkStartTime = 0;
+        this.isFirstChunk = true;
+        this.expressionFrameBuffer = [];
     }
 
     // ========================================

@@ -1,0 +1,107 @@
+---
+// LAMAvatar.astro - Gaussian Splat 3Dアバター + ARKit 52ブレンドシェイプ リップシンク
+// gaussian-splat-renderer-for-lam (aigc3d/LAM_WebRender) を使用
+---
+
+<div class="lam-avatar-wrapper" id="lamAvatarContainer"></div>
+
+<style>
+.lam-avatar-wrapper {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.lam-avatar-wrapper :global(canvas) {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+</style>
+
+<script>
+  import type { ExpressionData } from '../scripts/chat/live-audio-manager';
+  import type { LiveAudioManager } from '../scripts/chat/live-audio-manager';
+  import { GaussianSplatRenderer } from 'gaussian-splat-renderer-for-lam';
+
+  interface LAMAvatarController {
+    setLiveAudioManager(manager: LiveAudioManager): void;
+    queueExpressionFrames(frames: ExpressionData[], frameRate: number): void;
+    clearFrameBuffer(): void;
+  }
+
+  let renderer: any = null;
+  let liveAudioManager: LiveAudioManager | null = null;
+
+  /**
+   * 現在のexpressionデータをARKitブレンドシェイプのオブジェクト形式で返す
+   * GaussianSplatRenderer の getExpressionData コールバック用
+   */
+  function getExpressionData(): Record<string, number> | null {
+    if (!liveAudioManager) return null;
+    const frame = liveAudioManager.getCurrentExpressionFrame();
+    if (!frame || !frame.names || !frame.weights) return null;
+
+    const result: Record<string, number> = {};
+    for (let i = 0; i < frame.names.length; i++) {
+      result[frame.names[i]] = frame.weights[i] || 0;
+    }
+    return result;
+  }
+
+  /**
+   * LAMAvatarの初期化
+   */
+  async function initLamAvatar() {
+    const container = document.getElementById('lamAvatarContainer');
+    if (!container) return;
+
+    try {
+      renderer = await GaussianSplatRenderer.getInstance(
+        container,
+        '/avatar/concierge.zip',
+        {
+          getExpressionData: getExpressionData,
+          backgroundColor: 'bae6fd',
+          alpha: 0
+        }
+      );
+      console.log('[LAMAvatar] Gaussian Splatモデル読み込み完了');
+    } catch (e) {
+      console.error('[LAMAvatar] 初期化エラー:', e);
+    }
+  }
+
+  // LAMAvatarController インターフェース（window.lamAvatarController として公開）
+  const controller: LAMAvatarController = {
+    setLiveAudioManager(manager: LiveAudioManager) {
+      liveAudioManager = manager;
+      console.log('[LAMAvatar] LiveAudioManager接続完了');
+    },
+
+    queueExpressionFrames(frames: ExpressionData[], _frameRate: number) {
+      if (liveAudioManager) return;
+      console.log(`[LAMAvatar] ${frames.length}フレームを直接キュー`);
+    },
+
+    clearFrameBuffer() {
+      console.log('[LAMAvatar] フレームバッファクリア');
+    },
+  };
+
+  (window as any).lamAvatarController = controller;
+
+  // 初期化実行（DOMContentLoaded が既に発火済みの場合にも対応）
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => initLamAvatar());
+  } else {
+    initLamAvatar();
+  }
+
+  // クリーンアップ
+  window.addEventListener('beforeunload', () => {
+    if (renderer && renderer.dispose) {
+      renderer.dispose();
+    }
+  });
+</script>

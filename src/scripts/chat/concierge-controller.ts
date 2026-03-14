@@ -23,18 +23,33 @@ export class ConciergeController extends CoreController {
   protected async init() {
     // 親クラスの初期化を実行
     await super.init();
-    
+
     // コンシェルジュ固有の要素とイベントを追加
     const query = (sel: string) => this.container.querySelector(sel) as HTMLElement;
     this.els.avatarContainer = query('.avatar-container');
     this.els.avatarImage = query('#avatarImage') as HTMLImageElement;
     this.els.modeSwitch = query('#modeSwitch') as HTMLInputElement;
-    
+
     // モードスイッチのイベントリスナー追加
     if (this.els.modeSwitch) {
       this.els.modeSwitch.addEventListener('change', () => {
         this.toggleMode();
       });
+    }
+
+    // ★ LAMAvatarにLiveAudioManagerを接続（フェーズ2: リップシンク）
+    this.linkLamAvatar();
+  }
+
+  // ★ LAMAvatar連携（フェーズ2: リップシンク）
+  private linkLamAvatar() {
+    const lamController = (window as any).lamAvatarController;
+    if (lamController) {
+      lamController.setLiveAudioManager(this.liveAudioManager);
+      console.log('[ConciergeController] LAMAvatar連携完了');
+    } else {
+      // LAMAvatarの初期化がまだの場合はリトライ
+      setTimeout(() => this.linkLamAvatar(), 2000);
     }
   }
 
@@ -174,6 +189,11 @@ export class ConciergeController extends CoreController {
   protected stopAllActivities() {
     super.stopAllActivities();
     this.stopAvatarAnimation();
+    // ★ LAMAvatarフレームバッファクリア（フェーズ2: リップシンク）
+    const lamController = (window as any).lamAvatarController;
+    if (lamController) {
+      lamController.clearFrameBuffer();
+    }
   }
 
   // ========================================
