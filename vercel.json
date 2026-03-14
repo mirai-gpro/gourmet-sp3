@@ -1,4 +1,8 @@
 {
+  "github": {
+    "silent": false,
+    "autoJobCancelation": true
+  },
   "headers": [
     {
       "source": "/sw.js",
