@@ -282,13 +282,6 @@ export class LiveAudioManager {
         frame_rate: number;
         chunk_index: number;
     }): void {
-        // ★ chunk_index===0 で新しい発話区間開始 → バッファリセット（連続ショップ説明対応）
-        if (data.chunk_index === 0) {
-            this.expressionFrameBuffer = [];
-            this.firstChunkStartTime = 0;
-            this._a2eDebugCounter = 0;
-        }
-
         // フレームレートとブレンドシェイプ名を更新
         if (data.frame_rate) this.expressionFrameRate = data.frame_rate;
         if (data.expression_names && data.expression_names.length > 0) {

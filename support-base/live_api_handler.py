@@ -516,7 +516,7 @@ class LiveAPISession:
                             await self._send_history_on_reconnect(session)
 
                             # 2. トリガーメッセージ（turn_complete=True）
-                            resume_text = self._resume_message or self._build_resume_context()
+                            resume_text = self._resume_message or "続きをお願いします"
                             self._resume_message = None
                             await session.send_client_content(
                                 turns=types.Content(
@@ -716,32 +716,23 @@ class LiveAPISession:
                                    room=self.client_sid)
 
                 # ショップ検索を実行
-                search_result_count = await self._handle_shop_search(user_request)
+                await self._handle_shop_search(user_request)
 
                 # function responseを返す（LiveAPI confirmed syntax）
-                if search_result_count > 0:
-                    result_msg = f"{search_result_count}件のお店を見つけて紹介しました。ユーザーの反応を待ってください。"
-                else:
-                    result_msg = (
-                        "検索しましたが、条件に合うお店が見つかりませんでした。"
-                        "ユーザーに条件の変更を提案してください（エリアを広げる、ジャンルを変える等）。"
-                        "同じ条件で再検索しないでください。"
-                    )
                 tool_response = types.LiveClientToolResponse(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
-                        response={"result": result_msg}
+                        response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
                 await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
-    async def _handle_shop_search(self, user_request: str) -> int:
+    async def _handle_shop_search(self, user_request: str):
         """
         ショップ検索を実行し、結果をブラウザに送信する（v5 §5.5）
-        戻り値: 検索結果の件数（0件の場合も含む）
 
         【設計】
         - shop_search_callback を呼び出してショップデータを取得
@@ -754,7 +745,7 @@ class LiveAPISession:
             self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
             }, room=self.client_sid)
-            return 0
+            return
 
         try:
             # ★ 同期ブロッキング呼び出しをイベントループ外で実行
@@ -770,17 +761,10 @@ class LiveAPISession:
                 self.socketio.emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
                 }, room=self.client_sid)
-                return 0
+                return
 
             shops = shop_data['shops']
             response_text = shop_data.get('response', '')
-
-            if self.mode != 'concierge':
-                # chatモード: 先行接続 + 1セッション方式
-                first_session_task = asyncio.ensure_future(
-                    self._create_shop_session(shops, len(shops))
-                )
-                logger.info(f"[ShopSearch] 1軒目セッション先行接続開始")
 
             # ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
@@ -790,21 +774,14 @@ class LiveAPISession:
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
-            if self.mode == 'concierge':
-                # コンシェルジュモード: 従来方式（1軒ごと再接続で安定動作）
-                await self._describe_shops_via_live_legacy(shops)
-            else:
-                # chatモード: 先行接続セッションを渡す
-                await self._describe_shops_via_live(shops, first_session_task=first_session_task)
-
-            return len(shops)
+            # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
+            await self._describe_shops_via_live(shops)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
             self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
             }, room=self.client_sid)
-            return 0
 
     def _process_turn_complete(self):
         """
@@ -845,118 +822,15 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    def _build_shop_instruction(self, shops: list, shop_number: int, total: int) -> str:
-        """全ショップ情報を含むシステムプロンプトを構築（1セッション方式用）"""
-        all_shops_context = "\n\n".join(
-            self._format_shop_for_prompt(shop, i + 1, total)
-            for i, shop in enumerate(shops)
-        )
-
-        instruction = self.system_prompt + f"""
-
-【現在のタスク：ショップ紹介】
-あなたは今、ユーザーに検索結果のお店を{total}軒紹介します。
-ユーザーが「N軒目のお店を紹介してください」と言ったら、該当するお店だけを紹介してください。
-
-{all_shops_context}
-
-【読み上げルール】
-1. 指定されたお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
-2. 店名、ジャンル、エリア、特徴、価格帯を含める
-3. マークダウン記法は使わない（音声出力のため）
-4. 「N軒目は」から始める
-5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
-6. 最後のお店（{total}軒目）の場合: 紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。
-"""
-        return instruction
-
-    async def _describe_shops_via_live(self, shops: list, first_session_task=None):
+    async def _describe_shops_via_live(self, shops: list):
         """
-        ショップ説明をLiveAPIで読み上げ（1セッション使い回し + 先行接続）
+        ショップ説明をLiveAPIで読み上げ（1軒ごとに再接続）（v5 §6.1）
 
         【設計根拠】
-        - 1セッション内で全店を紹介し、接続オーバーヘッドを削減
-        - 累積文字数が800文字を超えた場合のみ再接続
-        - 1軒目のセッション接続はshop_search_result送信と並行で先行開始
-        """
-        total = len(shops)
-        char_count = 0
-        session = None
-        session_ctx = None
-
-        try:
-            for i, shop in enumerate(shops):
-                if not self.is_running:
-                    break
-
-                shop_number = i + 1
-
-                # セッション確立（先行接続 or 新規）
-                if session is None:
-                    if first_session_task:
-                        try:
-                            session, session_ctx = await first_session_task
-                            first_session_task = None
-                            logger.info(f"[ShopDesc] 先行接続セッション取得完了")
-                        except Exception as e:
-                            logger.error(f"[ShopDesc] 先行接続失敗、新規接続: {e}")
-                            first_session_task = None
-
-                    if session is None:
-                        try:
-                            session, session_ctx = await self._create_shop_session(shops, total)
-                        except Exception as e:
-                            logger.error(f"[ShopDesc] セッション接続失敗: {e}")
-                            break
-
-                # トリガー送信
-                trigger_text = f"{shop_number}軒目のお店を紹介してください。"
-                if shop_number == 1:
-                    trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
-
-                try:
-                    await session.send_client_content(
-                        turns=types.Content(
-                            role="user",
-                            parts=[types.Part(text=trigger_text)]
-                        ),
-                        turn_complete=True
-                    )
-
-                    desc_text = await self._receive_shop_description(session, shop_number)
-                    char_count += len(desc_text)
-                    logger.info(f"[ShopDesc] 累積文字数: {char_count}/{MAX_AI_CHARS_BEFORE_RECONNECT}")
-
-                except Exception as e:
-                    logger.error(f"[ShopDesc] ショップ{shop_number}説明エラー: {e}")
-                    # セッション破損の可能性があるのでクローズ
-                    await self._close_shop_session(session_ctx)
-                    session, session_ctx = None, None
-                    continue
-
-                # 累積文字数チェック → 次の店があれば再接続
-                if char_count >= MAX_AI_CHARS_BEFORE_RECONNECT and shop_number < total:
-                    logger.info(f"[ShopDesc] 累積{char_count}文字超過、再接続")
-                    self.socketio.emit('live_reconnecting', {}, room=self.client_sid)
-                    await self._close_shop_session(session_ctx)
-                    session, session_ctx = None, None
-                    char_count = 0
-                    self.socketio.emit('live_reconnected', {}, room=self.client_sid)
-
-        finally:
-            # セッションが残っていればクローズ
-            await self._close_shop_session(session_ctx)
-
-        # 全ショップ説明完了 → 通常会話に復帰
-        summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
-        self._add_to_history("ai", summary)
-        self._resume_message = "ありがとうございます。気になるお店について教えてください。"
-        self.needs_reconnect = True  # 通常会話に復帰するために再接続
-
-    async def _describe_shops_via_live_legacy(self, shops: list):
-        """
-        ショップ説明をLiveAPIで読み上げ（1軒ごとに再接続・従来方式）
-        コンシェルジュモード用。安定性を優先し、1軒ずつセッションを作り直す。
+        stt_stream.py の再接続メカニズムと同じ手法:
+        - 累積文字数制限(800文字)を回避するため、1軒ごとに再接続
+        - 再接続時に system_prompt にコンテキストを注入
+        - send_client_content() でトリガーメッセージを送信
         """
         total = len(shops)
 
@@ -989,6 +863,7 @@ class LiveAPISession:
             try:
                 config = self._build_config()
                 config["system_instruction"] = shop_instruction
+                # ショップ説明時はfunction callingのtoolsを外す
                 config.pop("tools", None)
 
                 async with self.client.aio.live.connect(
@@ -1017,39 +892,17 @@ class LiveAPISession:
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
         self._add_to_history("ai", summary)
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
-        self.needs_reconnect = True
+        self.needs_reconnect = True  # 通常会話に復帰するために再接続
 
-    async def _create_shop_session(self, shops: list, total: int):
-        """ショップ説明用セッションを作成（コンテキストマネージャを手動管理）"""
-        instruction = self._build_shop_instruction(shops, 1, total)
-        config = self._build_config()
-        config["system_instruction"] = instruction
-        config.pop("tools", None)
-
-        ctx = self.client.aio.live.connect(
-            model=LIVE_API_MODEL,
-            config=config
-        )
-        session = await ctx.__aenter__()
-        return session, ctx
-
-    async def _close_shop_session(self, session_ctx):
-        """ショップ説明用セッションを安全にクローズ"""
-        if session_ctx:
-            try:
-                await session_ctx.__aexit__(None, None, None)
-            except Exception as e:
-                logger.warning(f"[ShopDesc] セッションクローズエラー: {e}")
-
-    async def _receive_shop_description(self, session, shop_number: int) -> str:
+    async def _receive_shop_description(self, session, shop_number: int):
         """
         ショップ説明専用の応答受信（v5 §6.2）
-        turn_completeまで受信して終了。説明テキストを返す（文字数カウント用）。
+        turn_completeまで受信して終了。
         """
         turn = session.receive()
         async for response in turn:
             if not self.is_running:
-                return ""
+                return
 
             if response.server_content:
                 sc = response.server_content
@@ -1059,14 +912,12 @@ class LiveAPISession:
                     # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                     await self._flush_a2e_buffer(force=True, is_final=True)
                     self._a2e_chunk_index = 0  # 次ターン用にリセット
-                    ai_text = ""
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
                         logger.info(f"[ShopDesc] ショップ{shop_number}: {ai_text}")
                         self._add_to_history("ai", ai_text)
                         self.ai_transcript_buffer = ""
-                    self.socketio.emit('turn_complete', {}, room=self.client_sid)
-                    return ai_text
+                    return
 
                 # 出力トランスクリプション
                 if (hasattr(sc, 'output_transcription')
@@ -1277,32 +1128,6 @@ class LiveAPISession:
 
         return ""
 
-    def _build_resume_context(self) -> str:
-        """
-        再接続時のトリガーメッセージを会話履歴から構築する。
-        コンシェルジュモードでは確定済み条件のサマリーを含める。
-        """
-        if self.mode != 'concierge' or not self.conversation_history:
-            return "続きをお願いします"
-
-        # 会話履歴からユーザーの発言を集約し、確定条件を抽出
-        user_texts = [
-            h['text'] for h in self.conversation_history if h['role'] == 'user'
-        ]
-        if not user_texts:
-            return "続きをお願いします"
-
-        # ユーザー発言を要約として結合（最大500文字）
-        combined = " / ".join(user_texts)
-        if len(combined) > 500:
-            combined = combined[-500:]
-
-        return (
-            f"【再接続・コンテキスト継続】これまでのユーザーの要望: {combined}\n"
-            f"上記の情報は既に取得済みです。同じ質問を繰り返さないでください。\n"
-            f"まだ不足している情報があれば、自然な会話で聞いてください。"
-        )
-
     async def _send_history_on_reconnect(self, session):
         """
         再接続時に会話履歴をsend_client_content()で再送する（v5 §3.2.1）
@@ -1313,7 +1138,7 @@ class LiveAPISession:
 
         - turnsは types.Content のリストとして送信
         - role は "user" または "model"（"ai"ではない）
-        - 直近10ターン、各300文字までに制限（コンシェルジュのコンテキスト保持強化）
+        - 直近10ターン、各150文字までに制限（トークン消費抑制）
         """
         if not self.conversation_history:
             return
@@ -1323,7 +1148,7 @@ class LiveAPISession:
 
         for h in recent:
             role = "user" if h['role'] == 'user' else "model"
-            text = h['text'][:300]
+            text = h['text'][:150]
             history_turns.append(
                 types.Content(
                     role=role,
