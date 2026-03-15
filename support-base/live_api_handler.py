@@ -766,7 +766,13 @@ class LiveAPISession:
             shops = shop_data['shops']
             response_text = shop_data.get('response', '')
 
-            # ショップカードデータをブラウザに送信
+            # ★ 1軒目のセッション接続を先行開始（カード表示と並行）
+            first_session_task = asyncio.ensure_future(
+                self._create_shop_session(shops, len(shops))
+            )
+            logger.info(f"[ShopSearch] 1軒目セッション先行接続開始")
+
+            # ショップカードデータをブラウザに送信（接続と並行）
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
@@ -774,8 +780,8 @@ class LiveAPISession:
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
-            # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
-            await self._describe_shops_via_live(shops)
+            # ショップ説明をLiveAPIで読み上げ（先行接続セッションを渡す）
+            await self._describe_shops_via_live(shops, first_session_task=first_session_task)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -822,58 +828,76 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    async def _describe_shops_via_live(self, shops: list):
-        """
-        ショップ説明をLiveAPIで読み上げ（1軒ごとに再接続）（v5 §6.1）
+    def _build_shop_instruction(self, shops: list, shop_number: int, total: int) -> str:
+        """全ショップ情報を含むシステムプロンプトを構築（1セッション方式用）"""
+        all_shops_context = "\n\n".join(
+            self._format_shop_for_prompt(shop, i + 1, total)
+            for i, shop in enumerate(shops)
+        )
 
-        【設計根拠】
-        stt_stream.py の再接続メカニズムと同じ手法:
-        - 累積文字数制限(800文字)を回避するため、1軒ごとに再接続
-        - 再接続時に system_prompt にコンテキストを注入
-        - send_client_content() でトリガーメッセージを送信
-        """
-        total = len(shops)
-
-        for i, shop in enumerate(shops):
-            if not self.is_running:
-                break
-
-            shop_number = i + 1
-            is_last = (shop_number == total)
-
-            shop_context = self._format_shop_for_prompt(shop, shop_number, total)
-
-            shop_instruction = self.system_prompt + f"""
+        instruction = self.system_prompt + f"""
 
 【現在のタスク：ショップ紹介】
-あなたは今、ユーザーに検索結果のお店を紹介しています。
+あなたは今、ユーザーに検索結果のお店を{total}軒紹介します。
+ユーザーが「N軒目のお店を紹介してください」と言ったら、該当するお店だけを紹介してください。
 
-{shop_context}
+{all_shops_context}
 
 【読み上げルール】
-1. このお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
+1. 指定されたお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
 2. 店名、ジャンル、エリア、特徴、価格帯を含める
 3. マークダウン記法は使わない（音声出力のため）
-4. 「{shop_number}軒目は」から始める
+4. 「N軒目は」から始める
 5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
+6. 最後のお店（{total}軒目）の場合: 紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。
 """
-            if is_last:
-                shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
+        return instruction
 
-            try:
-                config = self._build_config()
-                config["system_instruction"] = shop_instruction
-                # ショップ説明時はfunction callingのtoolsを外す
-                config.pop("tools", None)
+    async def _describe_shops_via_live(self, shops: list, first_session_task=None):
+        """
+        ショップ説明をLiveAPIで読み上げ（1セッション使い回し + 先行接続）
 
-                async with self.client.aio.live.connect(
-                    model=LIVE_API_MODEL,
-                    config=config
-                ) as session:
-                    trigger_text = f"{shop_number}軒目のお店を紹介してください。"
-                    if shop_number == 1:
-                        trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
+        【設計根拠】
+        - 1セッション内で全店を紹介し、接続オーバーヘッドを削減
+        - 累積文字数が800文字を超えた場合のみ再接続
+        - 1軒目のセッション接続はshop_search_result送信と並行で先行開始
+        """
+        total = len(shops)
+        char_count = 0
+        session = None
+        session_ctx = None
 
+        try:
+            for i, shop in enumerate(shops):
+                if not self.is_running:
+                    break
+
+                shop_number = i + 1
+
+                # セッション確立（先行接続 or 新規）
+                if session is None:
+                    if first_session_task:
+                        try:
+                            session, session_ctx = await first_session_task
+                            first_session_task = None
+                            logger.info(f"[ShopDesc] 先行接続セッション取得完了")
+                        except Exception as e:
+                            logger.error(f"[ShopDesc] 先行接続失敗、新規接続: {e}")
+                            first_session_task = None
+
+                    if session is None:
+                        try:
+                            session, session_ctx = await self._create_shop_session(shops, total)
+                        except Exception as e:
+                            logger.error(f"[ShopDesc] セッション接続失敗: {e}")
+                            break
+
+                # トリガー送信
+                trigger_text = f"{shop_number}軒目のお店を紹介してください。"
+                if shop_number == 1:
+                    trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
+
+                try:
                     await session.send_client_content(
                         turns=types.Content(
                             role="user",
@@ -882,11 +906,29 @@ class LiveAPISession:
                         turn_complete=True
                     )
 
-                    await self._receive_shop_description(session, shop_number)
+                    desc_text = await self._receive_shop_description(session, shop_number)
+                    char_count += len(desc_text)
+                    logger.info(f"[ShopDesc] 累積文字数: {char_count}/{MAX_AI_CHARS_BEFORE_RECONNECT}")
 
-            except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{shop_number}説明エラー: {e}")
-                continue
+                except Exception as e:
+                    logger.error(f"[ShopDesc] ショップ{shop_number}説明エラー: {e}")
+                    # セッション破損の可能性があるのでクローズ
+                    await self._close_shop_session(session_ctx)
+                    session, session_ctx = None, None
+                    continue
+
+                # 累積文字数チェック → 次の店があれば再接続
+                if char_count >= MAX_AI_CHARS_BEFORE_RECONNECT and shop_number < total:
+                    logger.info(f"[ShopDesc] 累積{char_count}文字超過、再接続")
+                    self.socketio.emit('live_reconnecting', {}, room=self.client_sid)
+                    await self._close_shop_session(session_ctx)
+                    session, session_ctx = None, None
+                    char_count = 0
+                    self.socketio.emit('live_reconnected', {}, room=self.client_sid)
+
+        finally:
+            # セッションが残っていればクローズ
+            await self._close_shop_session(session_ctx)
 
         # 全ショップ説明完了 → 通常会話に復帰
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
@@ -894,15 +936,37 @@ class LiveAPISession:
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
         self.needs_reconnect = True  # 通常会話に復帰するために再接続
 
-    async def _receive_shop_description(self, session, shop_number: int):
+    async def _create_shop_session(self, shops: list, total: int):
+        """ショップ説明用セッションを作成（コンテキストマネージャを手動管理）"""
+        instruction = self._build_shop_instruction(shops, 1, total)
+        config = self._build_config()
+        config["system_instruction"] = instruction
+        config.pop("tools", None)
+
+        ctx = self.client.aio.live.connect(
+            model=LIVE_API_MODEL,
+            config=config
+        )
+        session = await ctx.__aenter__()
+        return session, ctx
+
+    async def _close_shop_session(self, session_ctx):
+        """ショップ説明用セッションを安全にクローズ"""
+        if session_ctx:
+            try:
+                await session_ctx.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning(f"[ShopDesc] セッションクローズエラー: {e}")
+
+    async def _receive_shop_description(self, session, shop_number: int) -> str:
         """
         ショップ説明専用の応答受信（v5 §6.2）
-        turn_completeまで受信して終了。
+        turn_completeまで受信して終了。説明テキストを返す（文字数カウント用）。
         """
         turn = session.receive()
         async for response in turn:
             if not self.is_running:
-                return
+                return ""
 
             if response.server_content:
                 sc = response.server_content
@@ -912,12 +976,14 @@ class LiveAPISession:
                     # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                     await self._flush_a2e_buffer(force=True, is_final=True)
                     self._a2e_chunk_index = 0  # 次ターン用にリセット
+                    ai_text = ""
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
                         logger.info(f"[ShopDesc] ショップ{shop_number}: {ai_text}")
                         self._add_to_history("ai", ai_text)
                         self.ai_transcript_buffer = ""
-                    return
+                    self.socketio.emit('turn_complete', {}, room=self.client_sid)
+                    return ai_text
 
                 # 出力トランスクリプション
                 if (hasattr(sc, 'output_transcription')
