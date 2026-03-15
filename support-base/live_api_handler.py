@@ -738,16 +738,29 @@ class LiveAPISession:
         - shop_search_callback を呼び出してショップデータを取得
         - コールバックは SupportAssistant.process_user_message() を内部的に呼び出す
         - 取得したデータはshop_search_resultイベントでブラウザに送信
+        - エラー時・空結果時もshop_search_resultを送信してフロントの待機を解除
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
+            self.socketio.emit('shop_search_result', {
+                'shops': [], 'response': '',
+            }, room=self.client_sid)
             return
 
         try:
-            shop_data = self._shop_search_callback(user_request, self.language, self.mode)
+            # ★ 同期ブロッキング呼び出しをイベントループ外で実行
+            loop = asyncio.get_event_loop()
+            shop_data = await loop.run_in_executor(
+                None,
+                self._shop_search_callback,
+                user_request, self.language, self.mode
+            )
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
+                self.socketio.emit('shop_search_result', {
+                    'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
+                }, room=self.client_sid)
                 return
 
             shops = shop_data['shops']
@@ -766,6 +779,9 @@ class LiveAPISession:
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
+            self.socketio.emit('shop_search_result', {
+                'shops': [], 'response': '',
+            }, room=self.client_sid)
 
     def _process_turn_complete(self):
         """
