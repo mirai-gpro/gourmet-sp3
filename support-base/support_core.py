@@ -567,7 +567,7 @@ class SupportAssistant:
                     'footer': '$C0AC$C6A9$C790$B294 $C704 $B808$C2A4$D1A0$B791$C5D0 $B300$D574 $C9C8$BB38$D558$ACE0 $C788$C2B5$B2C8$B2E4. $B808$C2A4$D1A0$B791 $C815$BCF4$B97C $CC38$C870$D558$C5EC $B2F5$BCC0$D558$C138$C694.'
                 }
             }
-            shop_context = f"\n\n{current_followup_msg['header']}\n{self._format_current_shops(current_shops)}\n\n{current_followup_msg['footer']}"
+            shop_context = f"\n\n{followup_messages[self.language]['header']}\n{self._format_current_shops(current_shops)}\n\n{followup_messages[self.language]['footer']}"
             system_prompt = self.system_prompt + shop_context
             logger.info("[Assistant] フォローアップ質問モード: 店舗情報をシステムプロンプトに追加")
 

@@ -716,23 +716,32 @@ class LiveAPISession:
                                    room=self.client_sid)
 
                 # ショップ検索を実行
-                await self._handle_shop_search(user_request)
+                search_result_count = await self._handle_shop_search(user_request)
 
                 # function responseを返す（LiveAPI confirmed syntax）
+                if search_result_count > 0:
+                    result_msg = f"{search_result_count}件のお店を見つけて紹介しました。ユーザーの反応を待ってください。"
+                else:
+                    result_msg = (
+                        "検索しましたが、条件に合うお店が見つかりませんでした。"
+                        "ユーザーに条件の変更を提案してください（エリアを広げる、ジャンルを変える等）。"
+                        "同じ条件で再検索しないでください。"
+                    )
                 tool_response = types.LiveClientToolResponse(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
-                        response={"result": "検索結果をユーザーに表示しました"}
+                        response={"result": result_msg}
                     )]
                 )
                 await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
-    async def _handle_shop_search(self, user_request: str):
+    async def _handle_shop_search(self, user_request: str) -> int:
         """
         ショップ検索を実行し、結果をブラウザに送信する（v5 §5.5）
+        戻り値: 検索結果の件数（0件の場合も含む）
 
         【設計】
         - shop_search_callback を呼び出してショップデータを取得
@@ -745,7 +754,7 @@ class LiveAPISession:
             self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
             }, room=self.client_sid)
-            return
+            return 0
 
         try:
             # ★ 同期ブロッキング呼び出しをイベントループ外で実行
@@ -761,7 +770,7 @@ class LiveAPISession:
                 self.socketio.emit('shop_search_result', {
                     'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
                 }, room=self.client_sid)
-                return
+                return 0
 
             shops = shop_data['shops']
             response_text = shop_data.get('response', '')
@@ -788,11 +797,14 @@ class LiveAPISession:
                 # chatモード: 先行接続セッションを渡す
                 await self._describe_shops_via_live(shops, first_session_task=first_session_task)
 
+            return len(shops)
+
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
             self.socketio.emit('shop_search_result', {
                 'shops': [], 'response': '',
             }, room=self.client_sid)
+            return 0
 
     def _process_turn_complete(self):
         """
@@ -1286,10 +1298,9 @@ class LiveAPISession:
             combined = combined[-500:]
 
         return (
-            f"【再接続】これまでのユーザーの要望: {combined}\n"
-            f"上記の情報は既に取得済みです。同じ質問を繰り返さず、"
-            f"まだ不足している情報があれば聞いてください。"
-            f"十分であればsearch_shopsを呼び出してください。"
+            f"【再接続・コンテキスト継続】これまでのユーザーの要望: {combined}\n"
+            f"上記の情報は既に取得済みです。同じ質問を繰り返さないでください。\n"
+            f"まだ不足している情報があれば、自然な会話で聞いてください。"
         )
 
     async def _send_history_on_reconnect(self, session):
