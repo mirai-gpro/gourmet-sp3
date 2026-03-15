@@ -317,10 +317,13 @@ export class LiveAudioManager {
     // フラグ切り替え
     // ========================================
     onAiResponseStarted(): void {
+        // ★ 新しいAI応答ターンの最初のチャンクのみリセット（仕様書08 セクション4.4）
+        if (!this.isAiSpeaking) {
+            this.firstChunkStartTime = 0;
+            this.expressionFrameBuffer = [];
+            this._a2eDebugCounter = 0;
+        }
         this.isAiSpeaking = true;
-        // ★ expression状態をリセット（仕様書08 セクション4.4）
-        this.firstChunkStartTime = 0;
-        this.expressionFrameBuffer = [];
     }
 
     onAiResponseEnded(): void {

@@ -291,6 +291,14 @@ export class CoreController {
       if (!this.isLiveMode) return;
       console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
       this.liveAudioManager.onExpressionReceived(data);
+
+      // ★ A2Eのブレンドシェイプ名順序をLAMレンダラーに反映（名前インデックス同期）
+      if (data.expression_names && data.expression_names.length > 0) {
+        const lamController = (window as any).__lamAvatarController;
+        if (lamController && typeof lamController.setExpressionNames === 'function') {
+          lamController.setExpressionNames(data.expression_names);
+        }
+      }
     });
 
     this.socket.on('user_transcript', (data: any) => {
