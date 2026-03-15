@@ -1010,6 +1010,17 @@ class LiveAPISession:
             # int16に戻す
             int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
 
+            # ★ A2Eへ送る音声データの品質ログ
+            duration_sec = len(int16_resampled) / 16000
+            rms = np.sqrt(np.mean(int16_resampled.astype(np.float32) ** 2))
+            peak = np.max(np.abs(int16_resampled))
+            logger.info(
+                f"[A2E Input] chunk {chunk_index}: "
+                f"samples={len(int16_resampled)}, duration={duration_sec:.3f}s, "
+                f"RMS={rms:.1f}, peak={peak}, "
+                f"is_start={chunk_index == 0}, is_final={is_final}"
+            )
+
             # raw int16 PCMをbase64エンコードしてJSON送信
             audio_b64 = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
 
@@ -1031,10 +1042,33 @@ class LiveAPISession:
                 names = result.get('names', [])
                 frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
 
+                # ★ A2Eレスポンスの詳細ログ
+                logger.info(
+                    f"[A2E Response] chunk {chunk_index}: "
+                    f"keys={list(result.keys())}, "
+                    f"names_count={len(names)}, frames_count={len(frames)}, "
+                    f"frame_rate={frame_rate}"
+                )
+
                 if frames:
                     # A2Eレスポンス frames: [{weights: [float]}] →
                     # フロントエンド expressions: [[float]] に変換
                     expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
+
+                    # ★ 先頭フレームの52パラメータを詳細出力
+                    first_expr = expressions[0] if expressions else []
+                    if first_expr:
+                        non_zero = [(names[i] if i < len(names) else f'[{i}]', v)
+                                    for i, v in enumerate(first_expr) if abs(v) > 0.001]
+                        non_zero_str = ', '.join(f'{n}={v:.4f}' for n, v in non_zero[:15])
+                        expr_arr = np.array(first_expr)
+                        logger.info(
+                            f"[A2E Params] chunk {chunk_index} firstFrame: "
+                            f"dims={len(first_expr)}, nonZero={len(non_zero)}/52, "
+                            f"min={expr_arr.min():.4f}, max={expr_arr.max():.4f}, "
+                            f"top: {{{non_zero_str}}}"
+                        )
+
                     self.socketio.emit('live_expression', {
                         'expressions': expressions,
                         'expression_names': names,
@@ -1042,8 +1076,10 @@ class LiveAPISession:
                         'chunk_index': chunk_index,
                     }, room=self.client_sid)
                     logger.info(f"[A2E] chunk {chunk_index}: {len(frames)} frames送信")
+                else:
+                    logger.warning(f"[A2E] chunk {chunk_index}: frames空! response={result}")
             else:
-                logger.warning(f"[A2E] サービスエラー: {response.status_code}")
+                logger.warning(f"[A2E] サービスエラー: {response.status_code}, body={response.text[:200]}")
 
         except Exception as e:
             logger.error(f"[A2E] 送信エラー: {e}")
