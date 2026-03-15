@@ -41,6 +41,7 @@ export const ARKIT_BLENDSHAPE_NAMES = [
 export class LAMWebSocketManager {
     private renderer: GaussianSplats3D.GaussianSplatRenderer | null = null;
     private isModelLoaded: boolean = false;
+    private _exprDebugCounter: number = 0;  // デバッグログ間引き用
 
     // 現在適用中の expression フレーム
     private currentExpression: ExpressionFrame | null = null;
@@ -111,6 +112,20 @@ export class LAMWebSocketManager {
         const values = this.currentExpression.values;
         for (let i = 0; i < Math.min(values.length, this.expressionNames.length); i++) {
             result[this.expressionNames[i]] = values[i];
+        }
+
+        // デバッグ: 120フレームごと（約2秒）にログ出力
+        this._exprDebugCounter++;
+        if (this._exprDebugCounter % 120 === 0) {
+            const jawOpen = result['jawOpen'] ?? 'N/A';
+            const mouthOpen = result['mouthOpen'] ?? 'N/A';
+            const nonZero = Object.entries(result).filter(([, v]) => v > 0.01).length;
+            console.log(
+                `[LAM ExprData] jawOpen=${typeof jawOpen === 'number' ? jawOpen.toFixed(3) : jawOpen}, ` +
+                `mouthOpen=${typeof mouthOpen === 'number' ? mouthOpen.toFixed(3) : mouthOpen}, ` +
+                `nonZero=${nonZero}/${this.expressionNames.length}, ` +
+                `valuesLen=${values.length}, namesLen=${this.expressionNames.length}`
+            );
         }
 
         return result;

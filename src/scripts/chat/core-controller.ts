@@ -289,6 +289,7 @@ export class CoreController {
     // ★ A2E expressionデータ受信（仕様書08 セクション5.1）
     this.socket.on('live_expression', (data: any) => {
       if (!this.isLiveMode) return;
+      console.log(`[A2E] live_expression受信: chunk=${data.chunk_index}, frames=${data.expressions?.length}, names=${data.expression_names?.length}, fps=${data.frame_rate}`);
       this.liveAudioManager.onExpressionReceived(data);
     });
 

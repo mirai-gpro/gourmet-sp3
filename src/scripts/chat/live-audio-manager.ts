@@ -66,6 +66,7 @@ export class LiveAudioManager {
     private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームデータ
     public expressionFrameRate: number = 30;           // fps（デフォルト30）
     public expressionNames: string[] = [];             // ARKit ブレンドシェイプ名
+    private _a2eDebugCounter: number = 0;              // デバッグログ間引き用
 
     // ========================================
     // セッション開始時に1度だけ呼ぶ
@@ -250,7 +251,21 @@ export class LiveAudioManager {
         const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
 
         if (clampedIndex < 0) return null;
-        return this.expressionFrameBuffer[clampedIndex];
+
+        const frame = this.expressionFrameBuffer[clampedIndex];
+
+        // デバッグ: 60フレームごと（約1秒）にログ出力
+        this._a2eDebugCounter++;
+        if (this._a2eDebugCounter % 60 === 0) {
+            const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
+            const jawVal = jawOpenIdx >= 0 && frame.values[jawOpenIdx] !== undefined
+                ? frame.values[jawOpenIdx].toFixed(3) : 'N/A';
+            console.log(
+                `[A2E Sync] offsetMs=${offsetMs.toFixed(0)}, frameIdx=${clampedIndex}/${this.expressionFrameBuffer.length}, jawOpen=${jawVal}`
+            );
+        }
+
+        return frame;
     }
 
     /**
@@ -271,6 +286,18 @@ export class LiveAudioManager {
         // フレームデータをバッファに追加
         for (const values of data.expressions) {
             this.expressionFrameBuffer.push({ values });
+        }
+
+        // デバッグ: バッファ状態とjawOpen値を出力
+        if (data.expressions.length > 0) {
+            const jawOpenIdx = this.expressionNames.indexOf('jawOpen');
+            const firstFrame = data.expressions[0];
+            const lastFrame = data.expressions[data.expressions.length - 1];
+            console.log(
+                `[A2E Buffer] chunk=${data.chunk_index}, +${data.expressions.length}frames, total=${this.expressionFrameBuffer.length}, ` +
+                `jawOpenIdx=${jawOpenIdx}, jawOpen=[${jawOpenIdx >= 0 ? firstFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}..${jawOpenIdx >= 0 ? lastFrame[jawOpenIdx]?.toFixed(3) : 'N/A'}], ` +
+                `firstChunkStartTime=${this.firstChunkStartTime.toFixed(3)}`
+            );
         }
     }
 
