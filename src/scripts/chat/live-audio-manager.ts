@@ -56,11 +56,9 @@ export class LiveAudioManager {
     public isAiSpeaking: boolean = false;
     private isStreaming: boolean = false;
 
-    // PCM再生キュー（24kHz）
-    private playbackQueue: AudioBuffer[] = [];
-    private isPlaying: boolean = false;
+    // PCM再生（24kHz）- 即時スケジューリング方式
     private nextPlayTime: number = 0;
-    private currentSource: AudioBufferSourceNode | null = null;  // interrupt時にstop()用
+    private scheduledSources: AudioBufferSourceNode[] = [];  // interrupt時にstop()用
 
     // ★ Expression同期機能（仕様書08 セクション4.1）
     private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
@@ -203,31 +201,29 @@ export class LiveAudioManager {
         const buffer = this.audioContext.createBuffer(1, float32.length, 24000);
         buffer.copyToChannel(float32, 0);
 
-        // キューに追加してシーケンシャルに再生
-        this.playbackQueue.push(buffer);
-        this._processPlaybackQueue();
+        // ★ 即時スケジューリング: チャンク到着時に未来時刻へ予約
+        // onended待ちの隙間が発生しないため、ブツブツ切れを防止
+        this._scheduleBuffer(buffer);
     }
 
-    private _processPlaybackQueue(): void {
-        if (this.isPlaying || this.playbackQueue.length === 0 || !this.audioContext) return;
-
-        this.isPlaying = true;
-        const buffer = this.playbackQueue.shift()!;
+    private _scheduleBuffer(buffer: AudioBuffer): void {
+        if (!this.audioContext) return;
 
         const source = this.audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(this.audioContext.destination);
 
         const now = this.audioContext.currentTime;
-        const startTime = Math.max(now, this.nextPlayTime);
+        // 少なくとも now + 0.005s 後に再生開始（スケジューリングマージン）
+        const startTime = Math.max(now + 0.005, this.nextPlayTime);
         source.start(startTime);
         this.nextPlayTime = startTime + buffer.duration;
 
-        this.currentSource = source;
+        // interrupt用にソースを追跡、終了時に自動除去
+        this.scheduledSources.push(source);
         source.onended = () => {
-            this.isPlaying = false;
-            this.currentSource = null;
-            this._processPlaybackQueue();
+            const idx = this.scheduledSources.indexOf(source);
+            if (idx !== -1) this.scheduledSources.splice(idx, 1);
         };
     }
 
@@ -310,14 +306,12 @@ export class LiveAudioManager {
     // 再生キューをクリア（割り込み時）
     // ========================================
     clearPlaybackQueue(): void {
-        this.playbackQueue = [];
         this.nextPlayTime = 0;
-        // 再生中の音声ソースを停止
-        if (this.currentSource) {
-            try { this.currentSource.stop(); } catch (_) { /* already stopped */ }
-            this.currentSource = null;
+        // スケジュール済みの全ソースを停止
+        for (const source of this.scheduledSources) {
+            try { source.stop(); } catch (_) { /* already stopped */ }
         }
-        this.isPlaying = false;
+        this.scheduledSources = [];
         // ★ expressionバッファもクリア
         this.expressionFrameBuffer = [];
         this.firstChunkStartTime = 0;
