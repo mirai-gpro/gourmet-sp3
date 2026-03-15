@@ -27,10 +27,9 @@ A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-417509
 # プロトコルが省略された場合に自動補完
 if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
-A2E_MIN_BUFFER_BYTES = 24000     # 最低バッファサイズ（24kHz 16bit mono × 0.5秒 = 24000bytes）
-                                 # ⚠️ 仕様書08: 0.5秒未満では表情データ品質が著しく劣化（実験実証済み）
-A2E_FIRST_FLUSH_BYTES = 48000   # 初回フラッシュ閾値（1秒分 = 48000bytes）品質確保しつつ初期遅延を抑制
-A2E_AUTO_FLUSH_BYTES = 72000    # 2回目以降フラッシュ閾値（1.5秒分 = 72000bytes）文節単位に近い粒度
+A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
+A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
+A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）品質優先
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
@@ -962,8 +961,8 @@ class LiveAPISession:
     def _on_output_transcription(self, text: str):
         """句読点検出でフラッシュ判定（仕様書08 セクション3.3）"""
         self._a2e_transcript_buffer += text
-        # 句読点（。？！、）を検出したらフラッシュ（仕様書08: 読点も区切りに含む）
-        flush_triggers = ['。', '？', '！', '?', '!', '、']
+        # 句読点（。？！）を検出したらフラッシュ
+        flush_triggers = ['。', '？', '！', '?', '!']
         if any(t in text for t in flush_triggers):
             asyncio.ensure_future(self._flush_a2e_buffer(force=False))
             self._a2e_transcript_buffer = ""
