@@ -969,7 +969,7 @@ class LiveAPISession:
     async def _send_to_a2e(self, pcm_data: bytes, chunk_index: int):
         """リサンプリング（24→16kHz）後、A2Eサービスに送信（仕様書08 セクション3.4）
 
-        A2E入力形式: 16kHz float32 LPCM（MP3変換禁止）
+        A2E入力形式: 16kHz 16bit mono PCM（base64エンコード、JSON送信）
         """
         try:
             # PCM 24kHz 16bit mono → numpy int16
@@ -978,34 +978,41 @@ class LiveAPISession:
             # 24kHz → 16kHz リサンプリング（SciPy resample_poly）
             resampled = resample_poly(int16_array.astype(np.float32), up=2, down=3)
 
-            # float32 LPCM に変換（-1.0 ~ 1.0）
-            float32_array = (resampled / 32768.0).astype(np.float32)
+            # int16に戻す（A2Eサービスは pcm_16000_16bit_mono を期待）
+            int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
 
-            # A2Eサービスに送信
+            # base64エンコードしてJSON送信
+            audio_b64 = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
+
             response = await self._a2e_http_client.post(
-                f"{A2E_SERVICE_URL}/process",
-                content=float32_array.tobytes(),
-                headers={
-                    'Content-Type': 'application/octet-stream',
-                    'X-Audio-Format': 'pcm_16000_float32',
-                    'X-Chunk-Index': str(chunk_index),
-                }
+                f"{A2E_SERVICE_URL}/api/audio2expression",
+                json={
+                    "audio_base64": audio_b64,
+                    "session_id": self.session_id,
+                    "audio_format": "pcm_16000_16bit_mono",
+                    "is_start": chunk_index == 0,
+                    "is_final": False,
+                },
+                timeout=10.0
             )
 
             if response.status_code == 200:
                 result = response.json()
-                expressions = result.get('expressions', [])
-                expression_names = result.get('expression_names', [])
+                frames = result.get('frames', [])
+                names = result.get('names', [])
                 frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
 
-                if expressions:
+                if frames:
+                    # A2Eレスポンス frames: [{weights: [float]}] →
+                    # フロントエンド expressions: [[float]] に変換
+                    expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
                     self.socketio.emit('live_expression', {
                         'expressions': expressions,
-                        'expression_names': expression_names,
+                        'expression_names': names,
                         'frame_rate': frame_rate,
                         'chunk_index': chunk_index,
                     }, room=self.client_sid)
-                    logger.info(f"[A2E] chunk {chunk_index}: {len(expressions)} frames送信")
+                    logger.info(f"[A2E] chunk {chunk_index}: {len(frames)} frames送信")
             else:
                 logger.warning(f"[A2E] サービスエラー: {response.status_code}")
 
