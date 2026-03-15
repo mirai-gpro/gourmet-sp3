@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# deploy trigger: c2732f6
 """
 Gemini LiveAPI ハンドラ（WebSocket プロキシ）
 stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
@@ -28,9 +27,8 @@ A2E_SERVICE_URL = os.getenv("A2E_SERVICE_URL", "https://audio2exp-service-417509
 # プロトコルが省略された場合に自動補完
 if A2E_SERVICE_URL and not A2E_SERVICE_URL.startswith("http"):
     A2E_SERVICE_URL = f"https://{A2E_SERVICE_URL}"
-A2E_MIN_BUFFER_BYTES = 4800      # 最低バッファサイズ（24kHz 16bit mono × 0.1秒 = 4800bytes）
-A2E_FIRST_FLUSH_BYTES = 4800     # 初回フラッシュ閾値（0.1秒分 = 4800bytes）遅延最小化
-A2E_AUTO_FLUSH_BYTES = 240000    # 2回目以降フラッシュ閾値（5秒分 = 240000bytes）品質優先
+A2E_MIN_BUFFER_BYTES = 24000  # 最低バッファサイズ（24kHz 16bit mono × 0.5秒 = 24000bytes）
+A2E_AUTO_FLUSH_BYTES = 72000  # 自動フラッシュ閾値（1.5秒分 = 72000bytes）
 A2E_EXPRESSION_FPS = 30
 
 # stt_stream.py から転記（変更禁止）
@@ -639,9 +637,8 @@ class LiveAPISession:
 
                     # 2. ターン完了
                     if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
-                        await self._flush_a2e_buffer(force=True, is_final=True)
-                        self._a2e_chunk_index = 0  # 次ターン用にリセット
+                        # ★ A2E: 残存バッファを強制フラッシュ（仕様書08 セクション3.4）
+                        await self._flush_a2e_buffer(force=True)
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
@@ -655,9 +652,6 @@ class LiveAPISession:
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
-                        # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
-                        await self._flush_a2e_buffer(force=True, is_final=True)
-                        self._a2e_chunk_index = 0  # 次ターン用にリセット
                         self.ai_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
                                            room=self.client_sid)
@@ -739,29 +733,16 @@ class LiveAPISession:
         - shop_search_callback を呼び出してショップデータを取得
         - コールバックは SupportAssistant.process_user_message() を内部的に呼び出す
         - 取得したデータはshop_search_resultイベントでブラウザに送信
-        - エラー時・空結果時もshop_search_resultを送信してフロントの待機を解除
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
-            self.socketio.emit('shop_search_result', {
-                'shops': [], 'response': '',
-            }, room=self.client_sid)
             return
 
         try:
-            # ★ 同期ブロッキング呼び出しをイベントループ外で実行
-            loop = asyncio.get_event_loop()
-            shop_data = await loop.run_in_executor(
-                None,
-                self._shop_search_callback,
-                user_request, self.language, self.mode
-            )
+            shop_data = self._shop_search_callback(user_request, self.language, self.mode)
 
             if not shop_data or not shop_data.get('shops'):
                 logger.info("[ShopSearch] ショップ見つからず")
-                self.socketio.emit('shop_search_result', {
-                    'shops': [], 'response': shop_data.get('response', '') if shop_data else '',
-                }, room=self.client_sid)
                 return
 
             shops = shop_data['shops']
@@ -780,9 +761,6 @@ class LiveAPISession:
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
-            self.socketio.emit('shop_search_result', {
-                'shops': [], 'response': '',
-            }, room=self.client_sid)
 
     def _process_turn_complete(self):
         """
@@ -910,9 +888,8 @@ class LiveAPISession:
 
                 # ターン完了
                 if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                    # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
-                    await self._flush_a2e_buffer(force=True, is_final=True)
-                    self._a2e_chunk_index = 0  # 次ターン用にリセット
+                    # ★ A2E: 残存バッファを強制フラッシュ
+                    await self._flush_a2e_buffer(force=True)
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
                         logger.info(f"[ShopDesc] ショップ{shop_number}: {ai_text}")
@@ -959,9 +936,8 @@ class LiveAPISession:
     def _buffer_for_a2e(self, pcm_data: bytes):
         """PCMをバッファに追加。閾値超過で自動フラッシュ（句読点待ち不要）"""
         self._a2e_audio_buffer.extend(pcm_data)
-        # ★ 初回は即フラッシュ（遅延最小化）、2回目以降は品質優先で大きく溜める
-        threshold = A2E_FIRST_FLUSH_BYTES if self._a2e_chunk_index == 0 else A2E_AUTO_FLUSH_BYTES
-        if len(self._a2e_audio_buffer) >= threshold:
+        # ★ サイズベース自動フラッシュ: 句読点がなくてもバッファが溜まったら送信
+        if len(self._a2e_audio_buffer) >= A2E_AUTO_FLUSH_BYTES:
             asyncio.ensure_future(self._flush_a2e_buffer(force=True))
 
     def _on_output_transcription(self, text: str):
@@ -973,7 +949,7 @@ class LiveAPISession:
             asyncio.ensure_future(self._flush_a2e_buffer(force=False))
             self._a2e_transcript_buffer = ""
 
-    async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False):
+    async def _flush_a2e_buffer(self, force: bool = False):
         """最低バイト数チェック後、非同期でA2E送信（仕様書08 セクション3.3）"""
         if len(self._a2e_audio_buffer) == 0:
             return
@@ -990,11 +966,11 @@ class LiveAPISession:
 
         # 非同期でA2Eに送信
         try:
-            await self._send_to_a2e(pcm_data, chunk_index, is_final=is_final)
+            await self._send_to_a2e(pcm_data, chunk_index)
         except Exception as e:
             logger.error(f"[A2E] フラッシュエラー: {e}")
 
-    async def _send_to_a2e(self, pcm_data: bytes, chunk_index: int, is_final: bool = False):
+    async def _send_to_a2e(self, pcm_data: bytes, chunk_index: int):
         """リサンプリング（24→16kHz）後、A2Eサービスに送信（仕様書08 セクション3.4）
 
         a2e_engine.py _decode_audio の "pcm" フォーマット:
@@ -1021,7 +997,7 @@ class LiveAPISession:
                     "session_id": self.session_id,
                     "audio_format": "pcm",
                     "is_start": chunk_index == 0,
-                    "is_final": is_final,
+                    "is_final": False,
                 },
                 timeout=10.0
             )
