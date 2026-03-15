@@ -928,8 +928,13 @@ class LiveAPISession:
                         self.socketio.emit('ai_transcript',
                                            {'text': text, 'type': 'shop_description'},
                                            room=self.client_sid)
-                        # ★ A2E: 句読点検出でバッファフラッシュ（仕様書08 セクション3.2）
-                        self._on_output_transcription(text)
+
+                # 出力トランスクリプション（ショップ説明 - A2E句読点検出）
+                if (hasattr(sc, 'output_transcription')
+                        and sc.output_transcription):
+                    text_tr = sc.output_transcription.text
+                    if text_tr:
+                        self._on_output_transcription(text_tr)
 
                 # 音声データ
                 if sc.model_turn:
