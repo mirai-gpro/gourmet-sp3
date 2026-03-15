@@ -50,8 +50,10 @@ const {
   position: relative;
 }
 
-/* ライブラリが生成するcanvasをコンテナ内に収める */
-.lam-avatar-container canvas {
+/* ライブラリが生成するcanvasをコンテナ内に収める（:globalで動的要素に適用） */
+.lam-avatar-container :global(canvas) {
+  width: 100% !important;
+  height: 100% !important;
   max-width: 100% !important;
   max-height: 100% !important;
   display: block;
