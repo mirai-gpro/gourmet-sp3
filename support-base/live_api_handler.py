@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# deploy trigger: c2732f6
 """
 Gemini LiveAPI ハンドラ（WebSocket プロキシ）
 stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
