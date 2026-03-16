@@ -119,6 +119,12 @@ class Audio2ExpressionEngine:
         self._infer = None       # INFER パイプラインインスタンス
         self._infer_context = None  # ストリーミング推論のコンテキスト
 
+        # ★ セッション単位のINFERコンテキスト保持
+        # API呼び出しごとにcontext=Noneにリセットすると、毎文節の冒頭で
+        # モデルがウォームアップし直し、最初の数十フレームが無表情になる。
+        # session_id単位でcontextを保持し、文節間で表情状態を引き継ぐ。
+        self._session_contexts: dict = {}  # session_id → INFER context
+
         # デバイス決定
         import torch
         if device == "auto":
@@ -371,44 +377,58 @@ class Audio2ExpressionEngine:
         """現在の推論モードを返す"""
         return "infer" if self._use_infer else "fallback"
 
-    def process(self, audio_base64: str, audio_format: str = "mp3") -> dict:
+    def process(self, audio_base64: str, audio_format: str = "mp3",
+                session_id: str = "default", is_start: bool = True,
+                is_final: bool = True) -> dict:
         """
         音声を処理してブレンドシェイプ係数を生成
 
         Args:
             audio_base64: base64エンコードされた音声
             audio_format: 音声フォーマット (mp3, wav, pcm)
+            session_id: セッションID（コンテキスト保持用）
+            is_start: ターンの最初のチャンクか
+            is_final: ターンの最後のチャンクか
 
         Returns:
             {names: [52 strings], frames: [[52 floats], ...], frame_rate: int}
         """
         audio_pcm = self._decode_audio(audio_base64, audio_format)
         duration = len(audio_pcm) / INFER_INPUT_SAMPLE_RATE
-        logger.info(f"[A2E Engine] Audio decoded: {duration:.2f}s at 16kHz")
+        logger.info(f"[A2E Engine] Audio decoded: {duration:.2f}s at 16kHz, "
+                    f"session={session_id}, is_start={is_start}, is_final={is_final}")
 
         if self._use_infer:
-            return self._process_with_infer(audio_pcm, duration)
+            return self._process_with_infer(audio_pcm, duration, session_id, is_start, is_final)
         else:
             return self._process_with_fallback(audio_pcm, duration)
 
-    def _process_with_infer(self, audio_pcm: np.ndarray, duration: float) -> dict:
+    def _process_with_infer(self, audio_pcm: np.ndarray, duration: float,
+                            session_id: str = "default",
+                            is_start: bool = True,
+                            is_final: bool = True) -> dict:
         """
         INFER パイプラインで推論。
 
-        infer_streaming_audio() を使用:
-        - 音声をチャンクに分割
-        - チャンクごとに推論 (コンテキスト引き継ぎ)
-        - ポストプロセッシング込み (smooth_mouth, frame_blending,
-          savitzky_golay, symmetrize, eye_blinks)
-
-        ★ 追加: INFERパイプラインのストリーミングモードでは
-          apply_random_brow_movement() が呼ばれず、
-          apply_random_eye_blinks_context() も短チャンクでは十分な
-          瞬きを生成しないため、結合後に追加ポストプロセスを適用する。
+        ★ セッション単位コンテキスト保持:
+          is_start=True でコンテキストリセット。
+          それ以外は前回のコンテキストを引き継ぎ、文節間で
+          表情の連続性を維持する。これにより毎文節冒頭の
+          「ゼロからウォームアップ」問題を解消する。
         """
         chunk_samples = INFER_INPUT_SAMPLE_RATE  # 1秒チャンク
         all_expressions = []
-        context = None
+
+        # ★ セッションコンテキストの取得/リセット
+        if is_start:
+            context = None
+            logger.info(f"[A2E Engine] Session {session_id}: context reset (is_start=True)")
+        else:
+            context = self._session_contexts.get(session_id)
+            if context is not None:
+                logger.info(f"[A2E Engine] Session {session_id}: resuming with existing context")
+            else:
+                logger.info(f"[A2E Engine] Session {session_id}: no prior context, starting fresh")
 
         try:
             for start in range(0, len(audio_pcm), chunk_samples):
@@ -424,6 +444,13 @@ class Audio2ExpressionEngine:
                 expr = result.get("expression")
                 if expr is not None:
                     all_expressions.append(expr.astype(np.float32))
+
+            # ★ コンテキストを保存（次のチャンクで引き継ぎ）
+            self._session_contexts[session_id] = context
+            if is_final:
+                # ターン終了時はコンテキスト削除（メモリリーク防止）
+                self._session_contexts.pop(session_id, None)
+                logger.info(f"[A2E Engine] Session {session_id}: context cleared (is_final=True)")
 
             if not all_expressions:
                 logger.warning("[A2E Engine] INFER produced no expression data")

@@ -105,7 +105,13 @@ def audio2expression():
                     f"format={audio_format}, size={len(audio_base64)} bytes")
 
         t0 = time.time()
-        result = engine.process(audio_base64, audio_format=audio_format)
+        result = engine.process(
+            audio_base64,
+            audio_format=audio_format,
+            session_id=session_id,
+            is_start=data.get('is_start', True),
+            is_final=data.get('is_final', True),
+        )
         elapsed = time.time() - t0
 
         frame_count = len(result.get('frames', []))
