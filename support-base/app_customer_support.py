@@ -790,9 +790,17 @@ def handle_live_start(data):
                 return None
             session.update_language(lang)
             session.update_mode(search_mode)
-            session.add_message('user', user_request, 'chat')
+            # ★ LiveAPIのfunction calling経由の検索リクエスト
+            # 会話キャッチボールはLiveAPI側で完了済み。
+            # ここではJSON形式のショップリストを返すことだけが役割。
+            search_message = (
+                f"以下の条件でお店を検索して、必ずJSON形式（shopsに5軒）で回答してください。"
+                f"会話や質問は不要です。検索結果のみ返してください。\n"
+                f"条件: {user_request}"
+            )
+            session.add_message('user', search_message, 'chat')
             assistant = SupportAssistant(session, SYSTEM_PROMPTS)
-            result = assistant.process_user_message(user_request, 'conversation')
+            result = assistant.process_user_message(search_message, 'conversation')
             if result.get('shops'):
                 session.add_message('model', result['response'], 'chat')
                 # REST版と同様にPlaces APIで写真・評価・URL等を補完
