@@ -81,6 +81,9 @@ def build_system_instruction(mode: str, user_profile: dict = None) -> str:
     else:
         base_prompt = _load_prompt_file("support_system_ja.txt")
 
+    # LiveAPI専用: 「喋る前にまずfunction call」を強制
+    # 音声生成とfunction call準備が同時に走ると1008で切断されるため
+    base_prompt += SEARCH_SHOPS_INSTRUCTION
     return base_prompt
 
 
