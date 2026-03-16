@@ -62,7 +62,8 @@ export class LiveAudioManager {
 
     // ★ Expression同期機能（仕様書08 セクション4.1）
     private firstChunkStartTime: number = 0;          // 最初のチャンク再生時刻
-    private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームデータ
+    private expressionFrameBuffer: ExpressionFrame[] = [];  // フレームデータ（chunk_index順に結合済み）
+    private expressionChunks: Map<number, ExpressionFrame[]> = new Map();  // chunk_index → frames（順序管理用）
     public expressionFrameRate: number = 30;           // fps（デフォルト30）
     public expressionNames: string[] = [];             // ARKit ブレンドシェイプ名
     private _a2eDebugCounter: number = 0;              // デバッグログ間引き用
@@ -246,11 +247,15 @@ export class LiveAudioManager {
         if (this.expressionFrameBuffer.length === 0) return null;
 
         // ★ 音声と同じ時間ベース（firstChunkStartTime）を使用
-        // expressionフレームは音声の特定時点に対応するため、音声基準で正確に同期
         const offsetMs = this.getCurrentPlaybackOffset();
         const frameIndex = Math.floor((offsetMs / 1000) * this.expressionFrameRate);
-        const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
 
+        // ★ turn終了後にフレーム末尾を超えたらnullを返す（staleデータ固着防止）
+        if (!this.isAiSpeaking && frameIndex >= this.expressionFrameBuffer.length) {
+            return null;
+        }
+
+        const clampedIndex = Math.min(frameIndex, this.expressionFrameBuffer.length - 1);
         if (clampedIndex < 0) return null;
 
         const frame = this.expressionFrameBuffer[clampedIndex];
@@ -284,9 +289,18 @@ export class LiveAudioManager {
             this.expressionNames = data.expression_names;
         }
 
-        // フレームデータをバッファに追加
-        for (const values of data.expressions) {
-            this.expressionFrameBuffer.push({ values });
+        // ★ チャンクをchunk_index順に管理（到着順序が前後しても正しく結合）
+        const frames: ExpressionFrame[] = data.expressions.map(values => ({ values }));
+        this.expressionChunks.set(data.chunk_index, frames);
+
+        // chunk_index順にフラットバッファを再構築
+        this.expressionFrameBuffer = [];
+        const sortedKeys = [...this.expressionChunks.keys()].sort((a, b) => a - b);
+        for (const key of sortedKeys) {
+            const chunkFrames = this.expressionChunks.get(key);
+            if (chunkFrames) {
+                this.expressionFrameBuffer.push(...chunkFrames);
+            }
         }
 
         // デバッグ: 全52パラメータの詳細ログ
@@ -347,6 +361,7 @@ export class LiveAudioManager {
         this.scheduledSources = [];
         // ★ expressionバッファもクリア
         this.expressionFrameBuffer = [];
+        this.expressionChunks.clear();
         this.firstChunkStartTime = 0;
     }
 
@@ -358,6 +373,7 @@ export class LiveAudioManager {
         if (!this.isAiSpeaking) {
             this.firstChunkStartTime = 0;
             this.expressionFrameBuffer = [];
+            this.expressionChunks.clear();
             this._a2eDebugCounter = 0;
         }
         this.isAiSpeaking = true;
