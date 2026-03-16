@@ -88,20 +88,26 @@ def build_system_instruction(mode: str, user_profile: dict = None) -> str:
 
 # LiveAPI専用のsearch_shopsツール使用指示
 # （テキストチャットのプロンプトには含めない）
+# Gemini LiveAPIでは音声応答モードだとモデルが「喋って満足」して
+# function callを発火せずにturn_completeしてしまう問題がある。
+# 対策: 「喋るより先にツールを呼べ」と明示的に指示する。
 SEARCH_SHOPS_INSTRUCTION = """
 
 ---
 
-## ショップ検索ツール（search_shops）
+## 【最重要】ショップ検索ツール（search_shops）の使い方
 
-お店を検索する際は、必ず search_shops ツールを呼び出すこと。
-テキストで検索結果を生成してはいけない。必ずfunction callingを使う。
+お店を検索する際は、必ず search_shops ツールをfunction callingで呼び出すこと。
 
-### 呼び出しルール
+### 絶対に守るルール
+- 検索が必要な場合は、ユーザーへの返答よりも先に search_shops を実行すること
+- 「お調べしますね」等と喋るだけでターンを終了してはいけない。喋ると同時にsearch_shopsを呼び出すこと
+- テキストや音声だけで応答して検索を省略することは絶対に禁止
+- search_shops を呼ばずにターンを終了することは禁止
+
+### 呼び出し方法
+- search_shops(user_request="恵比寿 イタリアン") のように、要望をキーワードで要約して渡す
 - ユーザーが条件を1つでも言ったら、即座に search_shops を呼び出す
-- search_shops(user_request="六本木 接待 イタリアン 1万円 4名") のように、要望を自然言語で要約して渡す
-- 「お調べしますね」と言った後、必ず search_shops を呼び出す
-- テキストだけで応答して検索を省略することは禁止
 """
 
 
@@ -260,6 +266,12 @@ class LiveAPISession:
             "response_modalities": ["AUDIO"],
             "system_instruction": instruction,
             "tools": [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION])],
+            "tool_config": types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="AUTO",
+                    allowed_function_names=["search_shops"],
+                )
+            ),
             "input_audio_transcription": {},
             "output_audio_transcription": {},
             "speech_config": {
