@@ -582,9 +582,6 @@ class LiveAPISession:
         for fc in tool_call.function_calls:
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
-                # user_requestが空の場合、ユーザーのトランスクリプトを使う
-                if not user_request.strip():
-                    user_request = self.user_transcript_buffer.strip()
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
