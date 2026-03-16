@@ -150,13 +150,13 @@ def _get_returning_user_context(preferred_name: str, name_honorific: str) -> str
 
 SEARCH_SHOPS_DECLARATION = types.FunctionDeclaration(
     name="search_shops",
-    description="ユーザーの条件に基づいてレストランを検索する。条件が十分に揃ったと判断した時に呼び出す。",
+    description="レストランを検索する。ユーザーがエリア・料理ジャンル・シーン・予算などの条件を1つでも言ったら即座に呼び出す。",
     parameters=types.Schema(
         type="OBJECT",
         properties={
             "user_request": types.Schema(
                 type="STRING",
-                description="ユーザーの要望の要約（例: '六本木 接待 イタリアン 1万円 4名'）"
+                description="検索用のキーワード群。ユーザーの要望からエリア・ジャンル・予算・人数等を抽出してスペース区切りで渡す。例: '恵比寿 イタリアン' '六本木 接待 和食 1万円 4名'"
             )
         },
         required=["user_request"]
@@ -268,7 +268,7 @@ class LiveAPISession:
             "tools": [types.Tool(function_declarations=[SEARCH_SHOPS_DECLARATION])],
             "tool_config": types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
-                    mode="AUTO",
+                    mode="ANY",
                     allowed_function_names=["search_shops"],
                 )
             ),
