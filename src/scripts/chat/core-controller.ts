@@ -18,7 +18,6 @@ export class CoreController {
   protected currentStage = 'conversation';
   protected isRecording = false; 
   protected waitOverlayTimer: number | null = null;
-  protected waitMessageTimer: number | null = null;
   protected isTTSEnabled = true;
   protected isUserInteracted = false;
   protected currentShops: any[] = [];
@@ -381,20 +380,12 @@ export class CoreController {
     this.socket.on('shop_search_start', () => {
       console.log('[LiveAPI] shop_search_start: 待機アニメーション表示');
       this.showWaitOverlay();
-      // 5秒後に「確認中です」音声を再生
-      this.waitMessageTimer = window.setTimeout(() => {
-        new Audio('/audio/please-wait.mp3').play().catch(e => console.log('[Audio] please-wait再生エラー:', e));
-      }, 5000);
     });
 
     // ★ ショップ検索結果（v5 §5: function callingによるサーバー内部処理の結果）
     this.socket.on('shop_search_result', (data: any) => {
       console.log('[LiveAPI] shop_search_result:', data?.shops?.length || 0, '件');
       this.hideWaitOverlay();
-      // ショップカード表示時に「お待たせしました」音声を再生
-      if (data?.shops?.length > 0) {
-        new Audio('/audio/announce-shops.mp3').play().catch(e => console.log('[Audio] announce-shops再生エラー:', e));
-      }
       const shops = data?.shops || [];
       if (shops.length > 0) {
         this.currentShops = shops;
@@ -1031,7 +1022,6 @@ export class CoreController {
 
   protected hideWaitOverlay() {
     if (this.waitOverlayTimer) { clearTimeout(this.waitOverlayTimer); this.waitOverlayTimer = null; }
-    if (this.waitMessageTimer) { clearTimeout(this.waitMessageTimer); this.waitMessageTimer = null; }
     this.els.waitOverlay.classList.add('hidden');
     setTimeout(() => this.els.waitVideo.pause(), 500);
   }

@@ -19,6 +19,7 @@ from scipy.signal import resample_poly
 import numpy as np
 from google import genai
 from google.genai import types
+from google.cloud import texttospeech
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,54 @@ A2E_EXPRESSION_FPS = 30
 LIVE_API_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 MAX_AI_CHARS_BEFORE_RECONNECT = 800
 LONG_SPEECH_THRESHOLD = 500
+
+# ============================================================
+# ショップ検索UX: 事前生成キャッシュ音声（24kHz 16bit mono PCM）
+# ============================================================
+_CACHED_ANNOUNCE_PCM: bytes | None = None   # 「お待たせしました、お店をご紹介しますね！」
+_CACHED_PLEASE_WAIT_PCM: bytes | None = None  # 「只今、お店の情報を確認中です。もう少々お待ち下さい」
+
+
+def _generate_cached_audio():
+    """起動時にTTSで音声を事前生成し、24kHz 16bit mono PCMとしてキャッシュ"""
+    global _CACHED_ANNOUNCE_PCM, _CACHED_PLEASE_WAIT_PCM
+    try:
+        tts_client = texttospeech.TextToSpeechClient()
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="ja-JP",
+            name="ja-JP-Chirp3-HD-Leda"
+        )
+        # LiveAPIと同じ24kHz LINEAR16で生成
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=24000,
+        )
+
+        messages = {
+            'announce': 'お待たせしました、お店をご紹介しますね！',
+            'please_wait': '只今、お店の情報を確認中です。もう少々お待ち下さい',
+        }
+
+        for key, text in messages.items():
+            resp = tts_client.synthesize_speech(
+                input=texttospeech.SynthesisInput(text=text),
+                voice=voice,
+                audio_config=audio_config,
+            )
+            # LINEAR16レスポンスにはWAVヘッダ(44bytes)が付くので除去
+            pcm = resp.audio_content[44:]
+            if key == 'announce':
+                _CACHED_ANNOUNCE_PCM = pcm
+            else:
+                _CACHED_PLEASE_WAIT_PCM = pcm
+            logger.info(f"[CachedAudio] '{key}' 生成完了: {len(pcm)} bytes")
+
+    except Exception as e:
+        logger.error(f"[CachedAudio] 事前生成失敗: {e}")
+
+
+# モジュール読み込み時に事前生成
+_generate_cached_audio()
 
 # ============================================================
 # プロンプト定義（03_prompt_modification_spec.md 準拠）
@@ -715,8 +764,18 @@ class LiveAPISession:
                 self.socketio.emit('shop_search_start', {},
                                    room=self.client_sid)
 
+                # 5秒後に「確認中です」音声を再生するタスクを並行起動
+                please_wait_task = asyncio.ensure_future(
+                    self._delayed_cached_audio(_CACHED_PLEASE_WAIT_PCM, delay=5.0)
+                )
+
                 # ショップ検索を実行
                 await self._handle_shop_search(user_request)
+
+                # 検索完了 → please_waitタスクをキャンセル（5秒以内に完了した場合）
+                if not please_wait_task.done():
+                    please_wait_task.cancel()
+                    logger.info("[CachedAudio] please_wait: 検索が5秒以内に完了、スキップ")
 
                 # function responseを返す（LiveAPI confirmed syntax）
                 tool_response = types.LiveClientToolResponse(
@@ -773,6 +832,9 @@ class LiveAPISession:
             }, room=self.client_sid)
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
+
+            # 「お待たせしました」音声をA2Eパイプライン経由で再生
+            await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
 
             # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
             await self._describe_shops_via_live(shops)
@@ -1048,6 +1110,39 @@ class LiveAPISession:
                                                    room=self.client_sid)
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
+
+    # ============================================================
+    # キャッシュ済み音声再生（A2Eパイプライン経由）
+    # ============================================================
+
+    async def _emit_cached_audio(self, pcm_data: bytes | None):
+        """キャッシュ済みPCM音声をlive_audio + A2Eパイプラインで送信
+        _emit_collected_shop() と同じパターン"""
+        if not pcm_data:
+            logger.warning("[CachedAudio] PCMデータなし、スキップ")
+            return
+
+        # PCMをチャンク分割してlive_audioで送信（LiveAPIと同じ形式）
+        CHUNK_SIZE = 4800  # 0.1秒分 (24kHz 16bit mono)
+        for i in range(0, len(pcm_data), CHUNK_SIZE):
+            chunk = pcm_data[i:i + CHUNK_SIZE]
+            audio_b64 = base64.b64encode(chunk).decode('utf-8')
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
+            self._buffer_for_a2e(chunk)
+
+        # A2E: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
+        logger.info(f"[CachedAudio] 再生完了: {len(pcm_data)} bytes")
+
+    async def _delayed_cached_audio(self, pcm_data: bytes | None, delay: float):
+        """指定秒数待機後にキャッシュ済み音声を再生"""
+        try:
+            await asyncio.sleep(delay)
+            await self._emit_cached_audio(pcm_data)
+        except asyncio.CancelledError:
+            pass  # 検索が先に完了した場合はキャンセルされる
 
     # ============================================================
     # A2E バッファリングメソッド（仕様書08 セクション3.3）
