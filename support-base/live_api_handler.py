@@ -13,7 +13,6 @@ import asyncio
 import base64
 import os
 import logging
-import re
 import struct
 import httpx
 from scipy.signal import resample_poly
@@ -392,11 +391,6 @@ class LiveAPISession:
         self.audio_queue_to_gemini = None
         self.is_running = False
 
-        # ★ search_shopsフォールバック: ターン数ベースの強制発火
-        self._hearing_turn_count = 0      # greeting後のユーザー発言ターン数
-        self._shop_search_triggered = False  # 検索済みフラグ
-        self._pending_shop_search = None   # フォールバック検索クエリ
-
     def _build_config(self, with_context=None):
         """
         Live API接続設定を構築
@@ -536,15 +530,6 @@ class LiveAPISession:
                                                room=self.client_sid)
 
                         await self._session_loop(session)
-
-                        # ★ フォールバック: search_shopsが発火しなかった場合の強制検索
-                        if hasattr(self, '_pending_shop_search') and self._pending_shop_search:
-                            search_query = self._pending_shop_search
-                            self._pending_shop_search = None
-                            logger.info(f"[LiveAPI] ★フォールバック検索実行: '{search_query}'")
-                            await self._handle_shop_search(search_query)
-                            # 検索後は通常会話に復帰（needs_reconnectは_describe_shops_via_liveで設定済み）
-                            continue
 
                         if not self.needs_reconnect:
                             break
@@ -725,7 +710,6 @@ class LiveAPISession:
             if fc.name == "search_shops":
                 user_request = fc.args.get("user_request", "")
                 logger.info(f"[LiveAPI] search_shops呼び出し: '{user_request}'")
-                self._shop_search_triggered = True  # ★ LLM正常発火
 
                 # 検索開始をブラウザに通知 → 待機アニメーション表示（§3.6.3）
                 self.socketio.emit('shop_search_start', {},
@@ -811,10 +795,6 @@ class LiveAPISession:
             self._add_to_history("user", user_text)
             self.user_transcript_buffer = ""
 
-            # ★ ヒアリングターン数をカウント（greeting後）
-            if not self._is_initial_greeting_phase and not self._shop_search_triggered:
-                self._hearing_turn_count += 1
-
         if self.ai_transcript_buffer.strip():
             ai_text = self.ai_transcript_buffer.strip()
             logger.info(f"[LiveAPI] AI: {ai_text}")
@@ -831,18 +811,6 @@ class LiveAPISession:
 
             self.ai_transcript_buffer = ""
 
-            # ★ search_shopsフォールバック判定（コンシェルジュモード）
-            if (self.mode == 'concierge'
-                    and not self._shop_search_triggered
-                    and self._hearing_turn_count >= 3):
-                conditions = self._extract_search_conditions()
-                if conditions:
-                    logger.info(f"[LiveAPI] ★フォールバック発火: {self._hearing_turn_count}ターン経過, 条件='{conditions}'")
-                    self._shop_search_triggered = True
-                    self._pending_shop_search = conditions
-                    self.needs_reconnect = True  # 現在のセッションを終了→検索実行
-                    return
-
             # 再接続判定
             if is_incomplete:
                 logger.info("[LiveAPI] 発言途切れのため再接続")
@@ -853,74 +821,6 @@ class LiveAPISession:
             elif self.ai_char_count >= MAX_AI_CHARS_BEFORE_RECONNECT:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
-
-    def _extract_search_conditions(self) -> str:
-        """
-        会話履歴からショップ検索条件を抽出する。
-        エリア＋（ジャンル or シーン）が揃っていれば条件文字列を返す。
-        不十分なら空文字を返す。
-        """
-        all_text = " ".join(h['text'] for h in self.conversation_history)
-
-        # エリアキーワード検出
-        area_keywords = [
-            '六本木', '銀座', '新宿', '渋谷', '恵比寿', '表参道', '青山',
-            '赤坂', '麻布', '西麻布', '品川', '東京', '丸の内', '日本橋',
-            '池袋', '目黒', '中目黒', '代官山', '原宿', '浜松町', '新橋',
-            '有楽町', '神田', '秋葉原', '上野', '浅草', '吉祥寺', '下北沢',
-            '自由が丘', '二子玉川', '横浜', '大阪', '梅田', '難波', '心斎橋',
-            '京都', '名古屋', '福岡', '札幌', '神戸',
-        ]
-        found_area = ""
-        for kw in area_keywords:
-            if kw in all_text:
-                found_area = kw
-                break
-
-        if not found_area:
-            return ""
-
-        # ジャンル・シーンキーワード検出
-        genre_keywords = [
-            'イタリアン', 'フレンチ', '和食', '寿司', '鮨', '焼肉', '焼き肉',
-            '中華', '韓国', 'タイ', 'インド', 'スペイン', '懐石', '割烹',
-            '天ぷら', 'うなぎ', '鰻', 'そば', '蕎麦', 'ラーメン', 'カフェ',
-            '居酒屋', 'バー', 'ビストロ', 'ステーキ', '鉄板焼', 'しゃぶしゃぶ',
-            'すき焼き', 'とんかつ',
-        ]
-        scene_keywords = [
-            '接待', 'デート', '記念日', '誕生日', '女子会', '忘年会', '新年会',
-            '歓送迎会', '合コン', '家族', 'ファミリー', 'ランチ', 'ディナー',
-            'カジュアル', '高級', '個室',
-        ]
-
-        found_genre = ""
-        for kw in genre_keywords:
-            if kw in all_text:
-                found_genre = kw
-                break
-        found_scene = ""
-        for kw in scene_keywords:
-            if kw in all_text:
-                found_scene = kw
-                break
-
-        if not found_genre and not found_scene:
-            return ""
-
-        # 条件文を組み立て
-        parts = [found_area]
-        if found_scene:
-            parts.append(found_scene)
-        if found_genre:
-            parts.append(found_genre)
-
-        # 予算があれば追加
-        budget_match = re.search(r'(\d[\d,]*万?\s*円|\d+万)', all_text)
-        if budget_match:
-            parts.append(budget_match.group(0))
-
-        return " ".join(parts)
 
     async def _describe_shops_via_live(self, shops: list):
         """
