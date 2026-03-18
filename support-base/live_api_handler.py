@@ -13,7 +13,6 @@ import asyncio
 import base64
 import os
 import logging
-import pathlib
 import struct
 import httpx
 from scipy.signal import resample_poly
@@ -40,31 +39,207 @@ MAX_AI_CHARS_BEFORE_RECONNECT = 800
 LONG_SPEECH_THRESHOLD = 500
 
 # ============================================================
-# プロンプト定義
-# GCS/ローカルのプロンプトファイルから読み込む
-# - support_system_ja.txt : グルメ(チャット)モード
-# - concierge_ja.txt      : コンシェルジュモード
+# ショップ検索UX: 事前生成キャッシュ音声（24kHz 16bit mono PCM）
+# ============================================================
+_CACHED_SEARCHING_PCM: bytes | None = None   # 「お店をお探ししますね」(0.5秒後)
+_CACHED_PLEASE_WAIT_PCM: bytes | None = None  # 「只今、お店の情報を確認中です。もう少々お待ち下さい」(6.5秒後)
+_CACHED_ANNOUNCE_PCM: bytes | None = None   # 「お待たせしました、お店をご紹介しますね！」(検索完了時)
+
+
+def _generate_cached_audio():
+    """起動時にTTSで音声を事前生成し、24kHz 16bit mono PCMとしてキャッシュ"""
+    global _CACHED_SEARCHING_PCM, _CACHED_PLEASE_WAIT_PCM, _CACHED_ANNOUNCE_PCM
+    try:
+        tts_client = texttospeech.TextToSpeechClient()
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="ja-JP",
+            name="ja-JP-Chirp3-HD-Leda"
+        )
+        # LiveAPIと同じ24kHz LINEAR16で生成
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=24000,
+        )
+
+        messages = {
+            'searching': 'お店をお探ししますね',
+            'please_wait': '只今、お店の情報を確認中です。もう少々お待ち下さい',
+            'announce': 'お待たせしました、お店をご紹介しますね！',
+        }
+
+        for key, text in messages.items():
+            resp = tts_client.synthesize_speech(
+                input=texttospeech.SynthesisInput(text=text),
+                voice=voice,
+                audio_config=audio_config,
+            )
+            # LINEAR16レスポンスにはWAVヘッダ(44bytes)が付くので除去
+            pcm = resp.audio_content[44:]
+            if key == 'searching':
+                _CACHED_SEARCHING_PCM = pcm
+            elif key == 'please_wait':
+                _CACHED_PLEASE_WAIT_PCM = pcm
+            else:
+                _CACHED_ANNOUNCE_PCM = pcm
+            logger.info(f"[CachedAudio] '{key}' 生成完了: {len(pcm)} bytes")
+
+    except Exception as e:
+        logger.error(f"[CachedAudio] 事前生成失敗: {e}")
+
+
+# モジュール読み込み時に事前生成
+_generate_cached_audio()
+
+# ============================================================
+# プロンプト定義（03_prompt_modification_spec.md 準拠）
+# テストフェーズ: ハードコード → 最終形: GCS移行
 # ============================================================
 
-_PROMPT_DIR = pathlib.Path(__file__).resolve().parent / "prompts"
+LIVEAPI_COMMON_RULES = """
+## 応答ルール（厳守）
 
+1. 【文字数制限】1回の発話は50文字以内。超過厳禁。
+2. 【簡潔さ】要点だけ伝える。修飾語・前置き・繰り返し不要。
+3. 【1トピック1ターン】1回の発話で扱う話題は1つだけ。
+4. 【ユーザーの番を奪わない】発話したら黙ってユーザーの返答を待つ。
+5. 【マークダウン禁止】音声出力のため、記号・箇条書き・URL不可。
+6. 【日本語】自然な話し言葉で応答する。書き言葉にならない。
+"""
 
-def _load_prompt_file(filename: str) -> str:
-    """ローカルのプロンプトファイルを読み込む"""
-    filepath = _PROMPT_DIR / filename
-    try:
-        return filepath.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        logger.error(f"[Prompt] ファイルが見つかりません: {filepath}")
-        return ""
+LIVEAPI_SHOP_CARD_RULES = """
+## ★★★ ショップ検索のルール（絶対厳守） ★★★
+
+### 検索の実行方法
+お店を探す場合は、必ず search_shops ツールを呼び出すこと。
+ツール呼び出し以外の方法で店舗情報を提供してはならない。
+
+### 絶対にやってはいけないこと
+- 自分でJSON形式のショップデータを生成して出力すること → 禁止
+- 架空の店舗名・住所・評価・URLを作成すること → 禁止
+- 「お探ししますね」「お調べしますね」と言うだけでツールを呼ばないこと → 禁止
+- search_shopsツール呼び出しと同時に音声応答すること → 禁止
+
+### ツール呼び出し時の正しい動作
+search_shops ツールを呼び出す際は、ツール呼び出しだけを行う。
+音声メッセージを同時に返してはならない（システムが案内音声を自動再生する）。
+
+### ツール実行後の動作
+search_shops ツールを呼び出した後は、システムが自動的に以下を行う：
+1. ショップカードUIの表示
+2. 各店舗の音声読み上げ
+あなたが検索結果をテキストや音声で説明する必要はない。
+ツール呼び出し後は、ユーザーの次の発話を待つこと。
+"""
+
+LIVEAPI_CHAT_SYSTEM = """あなたはグルメAIアシスタントです。
+ユーザーのお店探しを手伝います。
+
+## 役割
+- ユーザーの希望を聞いて、お店の条件を整理する。
+- 条件が揃ったら search_shops ツールを呼び出して店舗検索を実行する。
+
+## 応答スタイル
+- フレンドリーで親しみやすい口調。
+- 「どのあたりで探しますか？」のように、1つずつ質問する。
+
+## 会話フロー（1ターン検索を最優先）
+- ユーザーが条件を1つでも言ったら、即座に search_shops ツールを呼び出す。
+- 追加質問は一切しない。予算・人数・シーンなどを聞き返さない。
+- 検索実行後に質問を続けることは禁止。
+- ツール呼び出し時に音声応答は不要（システムが案内音声を自動再生する）。
+
+{shop_card_rules}
+
+{common_rules}
+"""
+
+LIVEAPI_CONCIERGE_SYSTEM = """あなたはグルメコンシェルジュです。
+高級レストランのコンシェルジュのように、丁寧にユーザーの好みを引き出してください。
+
+## 役割
+- 会話のキャッチボールを通じて、ユーザーの本当の希望を引き出す。
+- 一方的に質問を並べるのではなく、ユーザーの回答に寄り添い、深掘りする。
+- 条件が十分に揃ったら、search_shopsツールを呼び出して店舗検索を実行する。
+
+{user_context}
+
+## 質問ルール（厳守）
+- 1ターンの質問は最大3つまで。それ以上は絶対に聞かない。
+- 理想は1ターン1質問。必要な場合のみ2-3に増やす。
+- ユーザーが答えやすい順番で聞く（まず大枠、次に詳細）。
+
+## 禁止事項
+以下のように一度に大量の質問を並べることは禁止：
+「料理のジャンルは？エリアは？人数は？目的は？予算は？雰囲気は？」
+→ ユーザーは一度にこれだけの質問には答えられない。
+→ これはコンシェルジュではなくアンケートである。
+
+## 正しい会話の進め方
+2ターン目以降: ユーザーの回答に応じて自然に深掘りする。
+例: 「接待ですね。和食と洋食、どちらがお好みですか？」
+例: 「お二人でしたら、カウンターのお店も素敵ですよ。いかがですか？」
+
+## 応答スタイル
+- 丁寧語（です・ます調）を基本とする。
+- 押しつけず、提案する姿勢。「いかがですか？」「よろしければ」を活用。
+- ユーザーの発言を受け止めてから次に進む。「素敵ですね」「なるほど」等。
+
+## 【短期記憶・セッション行動ルール（最重要・厳守）】
+
+### 1. 短期記憶の前提
+あなたは会話履歴の内容を記憶している前提で行動すること。
+会話中に一度確定・明示された情報は、ユーザーが条件を変えない限り有効。
+「覚えていない前提」での聞き直しは絶対に禁止。
+
+### 2. 記憶対象（会話履歴から把握すべき情報）
+- 利用目的・シーン（接待、デート、忘年会、女子会、家族利用 等）
+- エリア・地域
+- 予算感
+- 参加人数
+- 料理ジャンル
+- 店の雰囲気・優先条件（個室、静か、カジュアル、高級 等）
+
+### 3. 重複質問の禁止ルール（絶対厳守）
+再質問してよいケース：ユーザーが明示的に条件変更を指示した場合のみ
+再質問してはいけないケース：すでに取得済みの条件を理由なく聞き直す行為
+
+### 4. 業態別ヒアリング制御
+簡易飲食業態（ラーメン、カフェ、ファーストフード等）は即提案優先
+
+### 5. 再接続時の行動ルール（LiveAPI固有・最重要）
+再接続後も会話履歴が再送されるので確認し、同じ質問を繰り返さない
+
+### 6. このルールの優先順位
+1位：本セクション > 2位：質問ルール > 3位：応答スタイル
+
+## 【ショップ検索の実行ルール（最重要・絶対厳守）】
+
+### 検索に必要な最低条件
+以下のうち、少なくとも2〜3項目が確定していれば検索を実行する：
+- エリア・地域
+- 料理ジャンルまたは利用シーン
+- 予算感（任意・なくても可）
+- 人数（任意・なくても可）
+
+### 検索を実行するタイミング
+- ユーザーが十分な条件を伝えた時点で、search_shopsツールを呼び出す
+- 全項目が揃うまで待つ必要はない
+- ユーザーが「もういいから探して」等と言った場合は即座に検索する
+- 簡易業態（ラーメン、カフェ等）はエリアだけでも検索可能
+
+### search_shopsツールの呼び出し方法
+- search_shops(user_request="六本木 接待 イタリアン 1万円 4名") のように呼び出す
+- user_request にはユーザーの要望を自然言語で要約して渡す
+
+{shop_card_rules}
+
+{common_rules}
+"""
 
 
 def build_system_instruction(mode: str, user_profile: dict = None) -> str:
     """モードに応じたシステムインストラクションを組み立てる
-
-    プロンプト本体は prompts/ ディレクトリのテキストファイルから読み込む。
-    コンシェルジュモードの {user_context} のみ動的に差し替える。
-    LiveAPI用にsearch_shopsツール使用指示を追記する。
+    （03_prompt_modification_spec.md セクション7.1）
 
     Args:
         mode: 'chat' or 'concierge'
@@ -76,46 +251,18 @@ def build_system_instruction(mode: str, user_profile: dict = None) -> str:
             }
     """
     if mode == 'concierge':
-        template = _load_prompt_file("concierge_ja.txt")
+        # ユーザープロファイルに応じた初期あいさつ指示を構築
         user_context = _build_concierge_user_context(user_profile)
-        base_prompt = template.replace("{user_context}", user_context)
+        return LIVEAPI_CONCIERGE_SYSTEM.format(
+            common_rules=LIVEAPI_COMMON_RULES,
+            user_context=user_context,
+            shop_card_rules=LIVEAPI_SHOP_CARD_RULES
+        )
     else:
-        base_prompt = _load_prompt_file("support_system_ja.txt")
-
-    return base_prompt
-
-
-# LiveAPI専用のsearch_shopsツール使用指示
-# （テキストチャットのプロンプトには含めない）
-# Gemini LiveAPIでは音声応答モードだとモデルが「喋って満足」して
-# function callを発火せずにturn_completeしてしまう問題がある。
-# 対策: 「喋るより先にツールを呼べ」と明示的に指示する。
-SEARCH_SHOPS_INSTRUCTION = """
-
----
-
-## 【最重要】ショップ検索ツール（search_shops）の使い方
-
-お店を検索する際は、必ず search_shops ツールをfunction callingで呼び出すこと。
-
-### 行動の優先順位（厳守）
-1. search_shops の実行が最優先。返事は二の次。
-2. 店探しを依頼されたら、挨拶は最小限（「わかりました」程度）にし、直ちに search_shops を実行すること。
-3. 検索結果が出る前に「今調べています」などと長々と喋ってターンを終了してはいけない。
-4. 何も喋らずに search_shops を呼び出しても良い（無言実行OK）。
-5. 音声で返答を生成しきる前に、必ず search_shops を呼び出すこと。
-
-### 絶対に守るルール
-- 「お調べしますね」等と喋るだけでターンを終了することは禁止
-- search_shops を呼ばずにターンを終了することは禁止
-- テキストや音声だけで応答して検索を省略することは絶対に禁止
-
-### 呼び出し方法
-- search_shops(user_request="恵比寿 イタリアン") のように、要望をキーワードで要約して渡す
-- ユーザーの音声が曖昧な場合は正しく補完する（例: 「エピス」→「恵比寿」）
-- ユーザーが条件を1つでも言ったら、即座に search_shops を呼び出す
-- 情報が不足していても呼び出してよい。エリアだけ、ジャンルだけでもOK。
-"""
+        return LIVEAPI_CHAT_SYSTEM.format(
+            common_rules=LIVEAPI_COMMON_RULES,
+            shop_card_rules=LIVEAPI_SHOP_CARD_RULES
+        )
 
 
 def _build_concierge_user_context(user_profile: dict = None) -> str:
@@ -218,9 +365,6 @@ class LiveAPISession:
         # 初期あいさつフェーズ（ダミーメッセージのinput_transcriptionを非表示）
         # （仕様書02 セクション4.5.5）
         self._is_initial_greeting_phase = True
-
-        # ターン内でtool_callを受信したかの追跡フラグ
-        self._tool_call_received_in_turn = False
 
         # Gemini APIクライアント
         api_key = os.getenv("GEMINI_API_KEY")
@@ -485,11 +629,7 @@ class LiveAPISession:
                     return
 
                 # 1. tool_call: search_shops（v5 §5.4）
-                # Native Audioモデルでは音声データの間にtool_callが
-                # 遅延して届くことがある。確実にキャッチする。
-                if response.tool_call:
-                    logger.info("[LiveAPI] !!! Function Call 発火 !!!")
-                    self._tool_call_received_in_turn = True
+                if hasattr(response, 'tool_call') and response.tool_call:
                     await self._handle_tool_call(response.tool_call, session)
                     continue
 
@@ -511,11 +651,6 @@ class LiveAPISession:
                             self.socketio.emit('greeting_done', {},
                                                room=self.client_sid)
                             logger.info("[LiveAPI] greeting_done送信")
-                        else:
-                            # ターン完了したがtool_callが来なかった場合をログ記録
-                            # （Native Audioモデルではtool_callが遅延する場合がある）
-                            logger.info(f"[LiveAPI] ターン完了（tool_call無し）: AI='{self.ai_transcript_buffer[:50]}'")
-                            self._tool_call_received_in_turn = False
 
                     # 3. 割り込み検知
                     if hasattr(sc, 'interrupted') and sc.interrupted:
@@ -591,14 +726,21 @@ class LiveAPISession:
                 # ショップ検索を実行
                 await self._handle_shop_search(user_request)
 
-                # function responseを返す
-                await session.send_tool_response(
+                # 検索完了 → 未再生のタスクをキャンセル
+                for task, name in [(searching_task, 'searching'), (please_wait_task, 'please_wait')]:
+                    if not task.done():
+                        task.cancel()
+                        logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
+
+                # function responseを返す（LiveAPI confirmed syntax）
+                tool_response = types.LiveClientToolResponse(
                     function_responses=[types.FunctionResponse(
                         name=fc.name,
                         id=fc.id,
                         response={"result": "検索結果をユーザーに表示しました"}
                     )]
                 )
+                await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
@@ -1016,17 +1158,6 @@ class LiveAPISession:
             # int16に戻す
             int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
 
-            # ★ A2Eへ送る音声データの品質ログ
-            duration_sec = len(int16_resampled) / 16000
-            rms = np.sqrt(np.mean(int16_resampled.astype(np.float32) ** 2))
-            peak = np.max(np.abs(int16_resampled))
-            logger.info(
-                f"[A2E Input] chunk {chunk_index}: "
-                f"samples={len(int16_resampled)}, duration={duration_sec:.3f}s, "
-                f"RMS={rms:.1f}, peak={peak}, "
-                f"is_start={chunk_index == 0}, is_final={is_final}"
-            )
-
             # raw int16 PCMをbase64エンコードしてJSON送信
             audio_b64 = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
 
@@ -1048,33 +1179,10 @@ class LiveAPISession:
                 names = result.get('names', [])
                 frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
 
-                # ★ A2Eレスポンスの詳細ログ
-                logger.info(
-                    f"[A2E Response] chunk {chunk_index}: "
-                    f"keys={list(result.keys())}, "
-                    f"names_count={len(names)}, frames_count={len(frames)}, "
-                    f"frame_rate={frame_rate}"
-                )
-
                 if frames:
                     # A2Eレスポンス frames: [{weights: [float]}] →
                     # フロントエンド expressions: [[float]] に変換
                     expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
-
-                    # ★ 先頭フレームの52パラメータを詳細出力
-                    first_expr = expressions[0] if expressions else []
-                    if first_expr:
-                        non_zero = [(names[i] if i < len(names) else f'[{i}]', v)
-                                    for i, v in enumerate(first_expr) if abs(v) > 0.001]
-                        non_zero_str = ', '.join(f'{n}={v:.4f}' for n, v in non_zero[:15])
-                        expr_arr = np.array(first_expr)
-                        logger.info(
-                            f"[A2E Params] chunk {chunk_index} firstFrame: "
-                            f"dims={len(first_expr)}, nonZero={len(non_zero)}/52, "
-                            f"min={expr_arr.min():.4f}, max={expr_arr.max():.4f}, "
-                            f"top: {{{non_zero_str}}}"
-                        )
-
                     self.socketio.emit('live_expression', {
                         'expressions': expressions,
                         'expression_names': names,
@@ -1082,10 +1190,8 @@ class LiveAPISession:
                         'chunk_index': chunk_index,
                     }, room=self.client_sid)
                     logger.info(f"[A2E] chunk {chunk_index}: {len(frames)} frames送信")
-                else:
-                    logger.warning(f"[A2E] chunk {chunk_index}: frames空! response={result}")
             else:
-                logger.warning(f"[A2E] サービスエラー: {response.status_code}, body={response.text[:200]}")
+                logger.warning(f"[A2E] サービスエラー: {response.status_code}")
 
         except Exception as e:
             logger.error(f"[A2E] 送信エラー: {e}")

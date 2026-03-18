@@ -114,25 +114,17 @@ export class LAMWebSocketManager {
             result[this.expressionNames[i]] = values[i];
         }
 
-        // デバッグ: 90フレームごと（約1.5秒）に口・目の主要パラメータをログ出力
+        // デバッグ: 120フレームごと（約2秒）にログ出力
         this._exprDebugCounter++;
-        if (this._exprDebugCounter % 90 === 0) {
-            const mouthKeys = ['jawOpen', 'mouthClose', 'mouthFunnel', 'mouthPucker',
-                'mouthSmileLeft', 'mouthSmileRight', 'mouthLowerDownLeft', 'mouthLowerDownRight',
-                'mouthUpperUpLeft', 'mouthUpperUpRight'];
-            const eyeKeys = ['eyeBlinkLeft', 'eyeBlinkRight', 'eyeWideLeft', 'eyeWideRight'];
-            const browKeys = ['browDownLeft', 'browDownRight', 'browInnerUp', 'browOuterUpLeft', 'browOuterUpRight'];
-
-            const fmt = (keys: string[]) => keys
-                .map(k => `${k}=${(result[k] ?? 0).toFixed(3)}`)
-                .join(', ');
-
+        if (this._exprDebugCounter % 120 === 0) {
+            const jawOpen = result['jawOpen'] ?? 'N/A';
+            const mouthOpen = result['mouthOpen'] ?? 'N/A';
             const nonZero = Object.entries(result).filter(([, v]) => v > 0.01).length;
             console.log(
-                `[LAM ExprData] nonZero=${nonZero}/52 | MOUTH: ${fmt(mouthKeys)}`
-            );
-            console.log(
-                `[LAM ExprData] EYES: ${fmt(eyeKeys)} | BROWS: ${fmt(browKeys)}`
+                `[LAM ExprData] jawOpen=${typeof jawOpen === 'number' ? jawOpen.toFixed(3) : jawOpen}, ` +
+                `mouthOpen=${typeof mouthOpen === 'number' ? mouthOpen.toFixed(3) : mouthOpen}, ` +
+                `nonZero=${nonZero}/${this.expressionNames.length}, ` +
+                `valuesLen=${values.length}, namesLen=${this.expressionNames.length}`
             );
         }
 
