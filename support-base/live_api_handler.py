@@ -20,6 +20,7 @@ from scipy.signal import resample_poly
 import numpy as np
 from google import genai
 from google.genai import types
+from google.cloud import texttospeech
 
 logger = logging.getLogger(__name__)
 
@@ -579,6 +580,14 @@ class LiveAPISession:
                 self.socketio.emit('shop_search_start', {},
                                    room=self.client_sid)
 
+                # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
+                searching_task = asyncio.ensure_future(
+                    self._delayed_cached_audio(_CACHED_SEARCHING_PCM, delay=0.5)
+                )
+                please_wait_task = asyncio.ensure_future(
+                    self._delayed_cached_audio(_CACHED_PLEASE_WAIT_PCM, delay=6.5)
+                )
+
                 # ショップ検索を実行
                 await self._handle_shop_search(user_request)
 
@@ -637,6 +646,9 @@ class LiveAPISession:
 
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
+            # 「お待たせしました」音声をA2Eパイプライン経由で再生
+            await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
+
             # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
             await self._describe_shops_via_live(shops)
 
@@ -687,26 +699,51 @@ class LiveAPISession:
 
     async def _describe_shops_via_live(self, shops: list):
         """
-        ショップ説明をLiveAPIで読み上げ（1軒ごとに再接続）（v5 §6.1）
+        ショップ説明をLiveAPIで読み上げ（v6 並行化）
 
-        【設計根拠】
-        stt_stream.py の再接続メカニズムと同じ手法:
-        - 累積文字数制限(800文字)を回避するため、1軒ごとに再接続
-        - 再接続時に system_prompt にコンテキストを注入
-        - send_client_content() でトリガーメッセージを送信
+        【改善】
+        - 1軒目: 即座にストリーミング再生（ユーザー待ち時間ゼロ）
+        - 2軒目以降: 1軒目再生中にバックグラウンドで並行生成
+        - 1軒目完了後、生成済み音声を順次再生（接続待ちなし）
         """
         total = len(shops)
+        if total == 0:
+            return
 
-        for i, shop in enumerate(shops):
+        # ── 2軒目以降の並行生成を即座に開始 ──
+        remaining_tasks = []
+        for i in range(1, total):
+            task = asyncio.create_task(
+                self._collect_shop_audio(shops[i], i + 1, total)
+            )
+            remaining_tasks.append(task)
+
+        # ── 1軒目: 即座にストリーミング再生 ──
+        await self._stream_single_shop(shops[0], 1, total)
+
+        # ── 2軒目以降: 生成済み音声を順次再生 ──
+        for i, task in enumerate(remaining_tasks):
             if not self.is_running:
                 break
+            try:
+                audio_chunks, transcript = await task
+                if audio_chunks:
+                    await self._emit_collected_shop(audio_chunks, transcript, i + 2)
+            except Exception as e:
+                logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
-            shop_number = i + 1
-            is_last = (shop_number == total)
+        # 全ショップ説明完了 → 通常会話に復帰
+        summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
+        self._add_to_history("ai", summary)
+        self._resume_message = "ありがとうございます。気になるお店について教えてください。"
+        self.needs_reconnect = True  # 通常会話に復帰するために再接続
 
-            shop_context = self._format_shop_for_prompt(shop, shop_number, total)
+    async def _stream_single_shop(self, shop, shop_number: int, total: int):
+        """1軒目用: 音声を直接ブラウザにストリーミング"""
+        is_last = (shop_number == total)
+        shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
-            shop_instruction = self.system_prompt + f"""
+        shop_instruction = self.system_prompt + f"""
 
 【現在のタスク：ショップ紹介】
 あなたは今、ユーザーに検索結果のお店を紹介しています。
@@ -720,42 +757,115 @@ class LiveAPISession:
 4. 「{shop_number}軒目は」から始める
 5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
 """
-            if is_last:
-                shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
+        if is_last:
+            shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
 
-            try:
-                config = self._build_config()
-                config["system_instruction"] = shop_instruction
-                # ショップ説明時はfunction callingのtoolsを外す
-                config.pop("tools", None)
+        try:
+            config = self._build_config()
+            config["system_instruction"] = shop_instruction
+            config.pop("tools", None)
 
-                async with self.client.aio.live.connect(
-                    model=LIVE_API_MODEL,
-                    config=config
-                ) as session:
-                    trigger_text = f"{shop_number}軒目のお店を紹介してください。"
-                    if shop_number == 1:
-                        trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
+            async with self.client.aio.live.connect(
+                model=LIVE_API_MODEL,
+                config=config
+            ) as session:
+                trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
+                await session.send_client_content(
+                    turns=types.Content(
+                        role="user",
+                        parts=[types.Part(text=trigger_text)]
+                    ),
+                    turn_complete=True
+                )
+                await self._receive_shop_description(session, shop_number)
 
-                    await session.send_client_content(
-                        turns=types.Content(
-                            role="user",
-                            parts=[types.Part(text=trigger_text)]
-                        ),
-                        turn_complete=True
-                    )
+        except Exception as e:
+            logger.error(f"[ShopDesc] ショップ{shop_number}ストリーミングエラー: {e}")
 
-                    await self._receive_shop_description(session, shop_number)
+    async def _collect_shop_audio(self, shop, shop_number: int, total: int):
+        """2軒目以降用: LiveAPI接続して音声をバッファに収集（ブラウザには送信しない）"""
+        is_last = (shop_number == total)
+        shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
-            except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{shop_number}説明エラー: {e}")
-                continue
+        shop_instruction = self.system_prompt + f"""
 
-        # 全ショップ説明完了 → 通常会話に復帰
-        summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
-        self._add_to_history("ai", summary)
-        self._resume_message = "ありがとうございます。気になるお店について教えてください。"
-        self.needs_reconnect = True  # 通常会話に復帰するために再接続
+【現在のタスク：ショップ紹介】
+あなたは今、ユーザーに検索結果のお店を紹介しています。
+
+{shop_context}
+
+【読み上げルール】
+1. このお店の特徴を自然な話し言葉で紹介する（3〜5文程度）
+2. 店名、ジャンル、エリア、特徴、価格帯を含める
+3. マークダウン記法は使わない（音声出力のため）
+4. 「{shop_number}軒目は」から始める
+5. 紹介が終わったら、次のお店の紹介に自然につなげる。「以上です」とは言わない。
+"""
+        if is_last:
+            shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
+
+        audio_chunks = []
+        transcript = ""
+
+        config = self._build_config()
+        config["system_instruction"] = shop_instruction
+        config.pop("tools", None)
+
+        async with self.client.aio.live.connect(
+            model=LIVE_API_MODEL,
+            config=config
+        ) as session:
+            trigger_text = f"{shop_number}軒目のお店を紹介してください。"
+            await session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text=trigger_text)]
+                ),
+                turn_complete=True
+            )
+
+            turn = session.receive()
+            async for response in turn:
+                if not self.is_running:
+                    break
+
+                if response.server_content:
+                    sc = response.server_content
+
+                    if hasattr(sc, 'turn_complete') and sc.turn_complete:
+                        break
+
+                    if (hasattr(sc, 'output_transcription')
+                            and sc.output_transcription
+                            and sc.output_transcription.text):
+                        transcript += sc.output_transcription.text
+
+                    if sc.model_turn:
+                        for part in sc.model_turn.parts:
+                            if (hasattr(part, 'inline_data')
+                                    and part.inline_data
+                                    and isinstance(part.inline_data.data, bytes)):
+                                audio_chunks.append(part.inline_data.data)
+
+        logger.info(f"[ShopDesc] ショップ{shop_number}並行生成完了: {len(audio_chunks)}チャンク, {len(transcript)}文字")
+        return audio_chunks, transcript
+
+    async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int):
+        """収集済み音声をブラウザに順次送信（A2E付き）"""
+        if transcript:
+            logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
+            self._add_to_history("ai", transcript)
+
+        for chunk in audio_chunks:
+            audio_b64 = base64.b64encode(chunk).decode('utf-8')
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
+            # ★ A2E: リップシンク用バッファ蓄積
+            self._buffer_for_a2e(chunk)
+
+        # A2E: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
 
     async def _receive_shop_description(self, session, shop_number: int):
         """
@@ -813,6 +923,39 @@ class LiveAPISession:
                                                    room=self.client_sid)
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
+
+    # ============================================================
+    # キャッシュ済み音声再生（A2Eパイプライン経由）
+    # ============================================================
+
+    async def _emit_cached_audio(self, pcm_data: bytes | None):
+        """キャッシュ済みPCM音声をlive_audio + A2Eパイプラインで送信
+        _emit_collected_shop() と同じパターン"""
+        if not pcm_data:
+            logger.warning("[CachedAudio] PCMデータなし、スキップ")
+            return
+
+        # PCMをチャンク分割してlive_audioで送信（LiveAPIと同じ形式）
+        CHUNK_SIZE = 4800  # 0.1秒分 (24kHz 16bit mono)
+        for i in range(0, len(pcm_data), CHUNK_SIZE):
+            chunk = pcm_data[i:i + CHUNK_SIZE]
+            audio_b64 = base64.b64encode(chunk).decode('utf-8')
+            self.socketio.emit('live_audio', {'data': audio_b64},
+                               room=self.client_sid)
+            self._buffer_for_a2e(chunk)
+
+        # A2E: 残存バッファをフラッシュ
+        await self._flush_a2e_buffer(force=True, is_final=True)
+        self._a2e_chunk_index = 0
+        logger.info(f"[CachedAudio] 再生完了: {len(pcm_data)} bytes")
+
+    async def _delayed_cached_audio(self, pcm_data: bytes | None, delay: float):
+        """指定秒数待機後にキャッシュ済み音声を再生"""
+        try:
+            await asyncio.sleep(delay)
+            await self._emit_cached_audio(pcm_data)
+        except asyncio.CancelledError:
+            pass  # 検索が先に完了した場合はキャンセルされる
 
     # ============================================================
     # A2E バッファリングメソッド（仕様書08 セクション3.3）

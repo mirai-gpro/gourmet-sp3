@@ -576,117 +576,79 @@ export class ConciergeController extends CoreController {
             this.isAISpeaking = true;
             if (this.isRecording) { this.stopStreamingSTT(); }
 
-            await this.speakTextGCP(this.t('ttsIntro'), true, false, isTextInput);
-            
+            // ── レスポンス解析 & TTS合成を即座に並行開始 ──
             const lines = data.response.split('\n\n');
-            let introText = ""; 
+            let introText = "";
             let shopLines = lines;
-            if (lines[0].includes('ご希望に合うお店') && lines[0].includes('ご紹介します')) { 
-              introText = lines[0]; 
-              shopLines = lines.slice(1); 
+            if (lines[0].includes('ご希望に合うお店') && lines[0].includes('ご紹介します')) {
+              introText = lines[0];
+              shopLines = lines.slice(1);
             }
-            
-            let introPart2Promise: Promise<void> | null = null;
-            if (introText && this.isTTSEnabled && this.isUserInteracted && !isTextInput) {
-                const preGeneratedIntro = this.preGeneratedAcks.get(introText);
+
+            const shopLangConfig = this.LANGUAGE_CODE_MAP[this.currentLanguage];
+            const ttsEnabled = this.isTTSEnabled && this.isUserInteracted && !isTextInput;
+
+            // ★ 各店舗のTTS合成を個別に並行開始（イントロ再生を待たない）
+            const shopAudioPromises: Promise<string | null>[] = [];
+            if (shopLines.length > 0 && ttsEnabled) {
+              for (const shopLine of shopLines) {
+                const cleanText = this.stripMarkdown(shopLine);
+                if (!cleanText) continue;
+                shopAudioPromises.push(
+                  fetch(`${this.apiBase}/api/tts/synthesize`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      text: cleanText, language_code: shopLangConfig.tts, voice_name: shopLangConfig.voice
+                    })
+                  })
+                  .then(r => r.json())
+                  .then(result => result.success ? `data:audio/mp3;base64,${result.audio}` : null)
+                  .catch(() => null)
+                );
+              }
+            }
+
+            // ── イントロ再生（TTS合成は裏で進行中） ──
+            await this.speakTextGCP(this.t('ttsIntro'), true, false, isTextInput);
+
+            if (introText && ttsEnabled) {
+              const preGeneratedIntro = this.preGeneratedAcks.get(introText);
               if (preGeneratedIntro) {
-                introPart2Promise = new Promise<void>((resolve) => {
+                await new Promise<void>((resolve) => {
                   this.lastAISpeech = this.normalizeText(introText);
                   this.ttsPlayer.src = `data:audio/mp3;base64,${preGeneratedIntro}`;
                   this.ttsPlayer.onended = () => resolve();
                   this.ttsPlayer.play();
                 });
-              } else { 
-                introPart2Promise = this.speakTextGCP(introText, false, false, isTextInput); 
+              } else {
+                await this.speakTextGCP(introText, false, false, isTextInput);
               }
             }
 
-            let firstShopAudioPromise: Promise<string | null> | null = null;
-            let remainingAudioPromise: Promise<string | null> | null = null;
-            const shopLangConfig = this.LANGUAGE_CODE_MAP[this.currentLanguage];
-            
-            if (shopLines.length > 0 && this.isTTSEnabled && this.isUserInteracted && !isTextInput) {
-              const firstShop = shopLines[0];
-              const restShops = shopLines.slice(1).join('\n\n');              
-              firstShopAudioPromise = (async () => {
-                const cleanText = this.stripMarkdown(firstShop);
-                const response = await fetch(`${this.apiBase}/api/tts/synthesize`, { 
-                  method: 'POST', 
-                  headers: { 'Content-Type': 'application/json' }, 
-                  body: JSON.stringify({ 
-                    text: cleanText, language_code: shopLangConfig.tts, voice_name: shopLangConfig.voice 
-                  }) 
-                });
-                const result = await response.json();
-                return result.success ? `data:audio/mp3;base64,${result.audio}` : null;
-              })();
-              
-              if (restShops) {
-                remainingAudioPromise = (async () => {
-                  const cleanText = this.stripMarkdown(restShops);
-                  const response = await fetch(`${this.apiBase}/api/tts/synthesize`, { 
-                    method: 'POST', 
-                    headers: { 'Content-Type': 'application/json' }, 
-                    body: JSON.stringify({ 
-                      text: cleanText, language_code: shopLangConfig.tts, voice_name: shopLangConfig.voice 
-                    }) 
-                  });
-                  const result = await response.json();
-                  return result.success ? `data:audio/mp3;base64,${result.audio}` : null;
-                })();
-              }
+            // ── 各店舗を順番に再生（音声準備でき次第） ──
+            for (let i = 0; i < shopAudioPromises.length; i++) {
+              const audio = await shopAudioPromises[i];
+              if (!audio) continue;
+
+              const shopText = this.stripMarkdown(shopLines[i]);
+              this.lastAISpeech = this.normalizeText(shopText);
+
+              if (i > 0) await new Promise(r => setTimeout(r, 300));
+
+              this.ttsPlayer.src = audio;
+              await new Promise<void>((resolve) => {
+                this.ttsPlayer.onended = () => {
+                  this.els.voiceStatus.innerHTML = this.t('voiceStatusStopped');
+                  this.els.voiceStatus.className = 'voice-status stopped';
+                  resolve();
+                };
+                this.els.voiceStatus.innerHTML = this.t('voiceStatusSpeaking');
+                this.els.voiceStatus.className = 'voice-status speaking';
+                this.ttsPlayer.play();
+              });
             }
 
-            if (introPart2Promise) await introPart2Promise;
-            
-            if (firstShopAudioPromise) {
-              const firstShopAudio = await firstShopAudioPromise;
-              if (firstShopAudio) {
-                const firstShopText = this.stripMarkdown(shopLines[0]);
-                this.lastAISpeech = this.normalizeText(firstShopText);
-                
-                if (!isTextInput && this.isTTSEnabled) {
-                  this.stopCurrentAudio();
-                }
-                
-                this.ttsPlayer.src = firstShopAudio;                
-                await new Promise<void>((resolve) => { 
-                  this.ttsPlayer.onended = () => { 
-                    this.els.voiceStatus.innerHTML = this.t('voiceStatusStopped'); 
-                    this.els.voiceStatus.className = 'voice-status stopped'; 
-                    resolve(); 
-                  }; 
-                  this.els.voiceStatus.innerHTML = this.t('voiceStatusSpeaking'); 
-                  this.els.voiceStatus.className = 'voice-status speaking'; 
-                  this.ttsPlayer.play(); 
-                });
-                
-                if (remainingAudioPromise) {
-                  const remainingAudio = await remainingAudioPromise;
-                  if (remainingAudio) {
-                    const restShopsText = this.stripMarkdown(shopLines.slice(1).join('\n\n'));
-                    this.lastAISpeech = this.normalizeText(restShopsText);
-                    await new Promise(r => setTimeout(r, 500));
-                    
-                    if (!isTextInput && this.isTTSEnabled) {
-                      this.stopCurrentAudio();
-                    }
-                    
-                    this.ttsPlayer.src = remainingAudio;                    
-                    await new Promise<void>((resolve) => { 
-                      this.ttsPlayer.onended = () => { 
-                        this.els.voiceStatus.innerHTML = '🎤 音声認識: 停止中'; 
-                        this.els.voiceStatus.className = 'voice-status stopped'; 
-                        resolve(); 
-                      }; 
-                      this.els.voiceStatus.innerHTML = '📊 音声再生中...'; 
-                      this.els.voiceStatus.className = 'voice-status speaking'; 
-                      this.ttsPlayer.play(); 
-                    });
-                  }
-                }
-              }
-            }
             this.isAISpeaking = false;
           } catch (_e) { this.isAISpeaking = false; }
         })();
