@@ -742,6 +742,7 @@ def health_check():
 # ========================================
 
 active_live_sessions = {}  # {client_sid: LiveAPISession}
+session_id_to_live_session = {}  # {session_id: LiveAPISession} ★案A: セッション再開用
 greeted_client_sids = set()  # 挨拶済みのclient_sid
 
 @socketio.on('live_start')
@@ -831,6 +832,8 @@ def handle_live_start(data):
         greeted_client_sids.add(client_sid)
 
     active_live_sessions[client_sid] = live_session
+    if session_id:
+        session_id_to_live_session[session_id] = live_session
 
     # 別スレッドでasyncioイベントループを実行（セクション10.3参照）
     def start_live_session_thread(session):
@@ -885,7 +888,47 @@ def handle_live_stop():
         live_session = active_live_sessions[client_sid]
         live_session.stop()
         del active_live_sessions[client_sid]
+        # ★案A: session_id_to_live_sessionからも削除
+        session_id_to_live_session.pop(live_session.session_id, None)
     emit('live_stopped', {'status': 'disconnected'})
+
+
+@socketio.on('live_resume')
+def handle_live_resume(data):
+    """★案A: Socket.IO再接続時にLiveAPIセッションを再開する
+
+    Socket.IOが切断→再接続された場合、client_sidが変わるが
+    session_idは同じ。既存のLiveAPISessionを新しいclient_sidに紐付ける。
+    """
+    new_client_sid = request.sid
+    session_id = data.get('session_id')
+
+    if not session_id:
+        logger.warning(f"[LiveAPI] live_resume: session_idなし → 新規開始が必要")
+        emit('live_resume_failed', {'reason': 'no_session_id'})
+        return
+
+    live_session = session_id_to_live_session.get(session_id)
+
+    if not live_session or not live_session.is_running:
+        logger.info(f"[LiveAPI] live_resume: セッション {session_id} なしまたは停止済み → 新規開始が必要")
+        emit('live_resume_failed', {'reason': 'session_not_found'})
+        return
+
+    old_client_sid = live_session.client_sid
+
+    # 旧client_sidの参照を削除
+    if old_client_sid in active_live_sessions:
+        del active_live_sessions[old_client_sid]
+    greeted_client_sids.discard(old_client_sid)
+
+    # 新しいclient_sidで再登録
+    live_session.client_sid = new_client_sid
+    active_live_sessions[new_client_sid] = live_session
+    greeted_client_sids.add(new_client_sid)
+
+    logger.info(f"[LiveAPI] live_resume成功: session={session_id}, old_sid={old_client_sid}, new_sid={new_client_sid}")
+    emit('live_resumed', {'status': 'resumed', 'session_id': session_id})
 
 
 # ========================================
@@ -902,13 +945,35 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     logger.info(f"[WebSocket STT] クライアント切断: {request.sid}")
-    # LiveAPIセッションのクリーンアップ
+    # ★案A: LiveAPIセッションが稼働中なら即停止しない（再接続猶予）
     if request.sid in active_live_sessions:
         live_session = active_live_sessions[request.sid]
-        live_session.stop()
-        del active_live_sessions[request.sid]
-        logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
-    # 挨拶済みフラグのクリーンアップ
+        if live_session.is_running:
+            # セッション稼働中 → active_live_sessionsからは外すが、stopしない
+            # session_id_to_live_session経由でlive_resumeで再開可能
+            del active_live_sessions[request.sid]
+            logger.info(f"[LiveAPI] クライアント切断、セッション維持（再接続待ち）: {request.sid}")
+
+            # 30秒後にまだ再接続されていなければ停止するタイマー
+            session_id = live_session.session_id
+            def delayed_cleanup():
+                import time as _time
+                _time.sleep(30)
+                # 30秒後にまだsession_id_to_live_sessionに残っていて、
+                # active_live_sessionsに再登録されていなければ停止
+                if (session_id in session_id_to_live_session
+                        and live_session.is_running
+                        and live_session.client_sid not in active_live_sessions):
+                    live_session.stop()
+                    del session_id_to_live_session[session_id]
+                    logger.info(f"[LiveAPI] 再接続タイムアウト、セッション停止: {session_id}")
+
+            cleanup_thread = threading.Thread(target=delayed_cleanup, daemon=True)
+            cleanup_thread.start()
+        else:
+            del active_live_sessions[request.sid]
+            logger.info(f"[LiveAPI] クライアント切断によりセッション停止: {request.sid}")
+    # 挨拶済みフラグのクリーンアップ（再接続時にlive_resumeで再設定される）
     greeted_client_sids.discard(request.sid)
     # STTストリームのクリーンアップ
     if request.sid in active_streams:

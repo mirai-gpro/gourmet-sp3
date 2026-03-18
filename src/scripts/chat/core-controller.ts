@@ -246,7 +246,34 @@ export class CoreController {
       timeout: 10000
     });
 
-    this.socket.on('connect', () => { });
+    this.socket.on('connect', () => {
+      // ★案A: Socket.IO再接続時にLiveAPIセッションを再開
+      if (this.isLiveMode && this.sessionId) {
+        console.log('[LiveAPI] Socket.IO再接続検知 → live_resume送信');
+        this.socket.emit('live_resume', {
+          session_id: this.sessionId,
+          mode: this.currentMode,
+          language: this.currentLanguage
+        });
+      }
+    });
+
+    // ★案A: live_resume成功
+    this.socket.on('live_resumed', (data: any) => {
+      console.log('[LiveAPI] セッション再開成功:', data?.session_id);
+    });
+
+    // ★案A: live_resume失敗 → 新規セッション開始にフォールバック
+    this.socket.on('live_resume_failed', (data: any) => {
+      console.warn('[LiveAPI] セッション再開失敗:', data?.reason, '→ 新規live_start');
+      if (this.isLiveMode && this.sessionId) {
+        this.socket.emit('live_start', {
+          session_id: this.sessionId,
+          mode: this.currentMode,
+          language: this.currentLanguage
+        });
+      }
+    });
 
     // 既存リスナー（STTフォールバック用に残す）
     this.socket.on('transcript', (data: any) => {

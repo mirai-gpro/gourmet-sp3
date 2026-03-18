@@ -869,6 +869,8 @@ class LiveAPISession:
         for i, task in enumerate(remaining_tasks):
             if not self.is_running:
                 break
+            # ★ イベントループ解放: ショップ間でSocket.IOのping/pongを処理
+            await asyncio.sleep(0)
             try:
                 audio_chunks, transcript = await task
                 if audio_chunks:
@@ -877,6 +879,8 @@ class LiveAPISession:
                 logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
         # 全ショップ説明完了 → 通常会話に復帰
+        # ★ イベントループ解放: 再接続前にSocket.IOのping/pongを確実に処理
+        await asyncio.sleep(0.1)
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
         self._add_to_history("ai", summary)
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
@@ -1171,6 +1175,9 @@ class LiveAPISession:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
             self.socketio.emit('live_audio', {'data': audio_b64},
                                room=self.client_sid)
+            # ★ イベントループ解放: Socket.IOのping/pongが処理される時間を確保
+            if i % (CHUNK_SIZE * 10) == 0:
+                await asyncio.sleep(0)
 
         logger.info(f"{label} A2E同期送信完了: {len(pcm_data)} bytes")
 
