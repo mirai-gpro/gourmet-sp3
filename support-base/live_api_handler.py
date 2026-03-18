@@ -641,6 +641,9 @@ class LiveAPISession:
                         # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
+                        # ★ A2E: ターン完了時にexpressionリセット通知
+                        self.socketio.emit('live_expression_reset',
+                                           room=self.client_sid)
                         self._process_turn_complete()
                         self.socketio.emit('turn_complete', {},
                                            room=self.client_sid)
@@ -657,6 +660,9 @@ class LiveAPISession:
                         # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                         await self._flush_a2e_buffer(force=True, is_final=True)
                         self._a2e_chunk_index = 0  # 次ターン用にリセット
+                        # ★ A2E: 割り込み時にexpressionリセット通知
+                        self.socketio.emit('live_expression_reset',
+                                           room=self.client_sid)
                         self.ai_transcript_buffer = ""
                         self.socketio.emit('interrupted', {},
                                            room=self.client_sid)
@@ -1026,6 +1032,9 @@ class LiveAPISession:
                     # ★ A2E: 残存バッファを強制フラッシュ（最終チャンク）
                     await self._flush_a2e_buffer(force=True, is_final=True)
                     self._a2e_chunk_index = 0  # 次ターン用にリセット
+                    # ★ A2E: ショップ説明ターン完了時もexpressionリセット通知
+                    self.socketio.emit('live_expression_reset',
+                                       room=self.client_sid)
                     if self.ai_transcript_buffer.strip():
                         ai_text = self.ai_transcript_buffer.strip()
                         logger.info(f"[ShopDesc] ショップ{shop_number}: {ai_text}")
