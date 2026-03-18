@@ -38,6 +38,7 @@ export class CoreController {
   protected isInBackground = false;
   protected backgroundStartTime = 0;
   protected readonly BACKGROUND_RESET_THRESHOLD = 120000; // 120秒
+  private _liveResumeSucceeded = false;  // ★ live_resume成功フラグ
 
   protected isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
   protected isAndroid = /Android/i.test(navigator.userAgent);
@@ -206,17 +207,51 @@ export class CoreController {
         const backgroundDuration = Date.now() - this.backgroundStartTime;
         console.log(`[Foreground] Resuming from background (${Math.round(backgroundDuration / 1000)}s)`);
 
-        // ★120秒以上バックグラウンドにいた場合はソフトリセット
-        if (backgroundDuration > this.BACKGROUND_RESET_THRESHOLD) {
-          console.log('[Foreground] Long background duration - triggering soft reset...');
-          await this.resetAppContent();
-          return;
-        }
-
         // 1. Socket.IO再接続（状態に関わらず試行）
         if (this.socket && !this.socket.connected) {
           console.log('[Foreground] Reconnecting socket...');
           this.socket.connect();
+        }
+
+        // ★120秒以上バックグラウンドにいた場合
+        if (backgroundDuration > this.BACKGROUND_RESET_THRESHOLD) {
+          if (this.isLiveMode && this.sessionId) {
+            // LiveMode中: live_resumeの結果を待ってから判断（最大3秒）
+            console.log('[Foreground] Long background + LiveMode → live_resume結果を待機');
+            this._liveResumeSucceeded = false;
+            await new Promise<void>(resolve => {
+              const timeout = setTimeout(() => {
+                console.log('[Foreground] live_resume待機タイムアウト');
+                resolve();
+              }, 3000);
+              const checkResume = () => {
+                if (this._liveResumeSucceeded) {
+                  clearTimeout(timeout);
+                  resolve();
+                }
+              };
+              // 100msごとにチェック
+              const interval = setInterval(() => {
+                checkResume();
+                if (this._liveResumeSucceeded) clearInterval(interval);
+              }, 100);
+              setTimeout(() => clearInterval(interval), 3100);
+            });
+
+            if (this._liveResumeSucceeded) {
+              console.log('[Foreground] live_resume成功 → リセットスキップ');
+              this._liveResumeSucceeded = false;
+            } else {
+              console.log('[Foreground] live_resume失敗/タイムアウト → ソフトリセット');
+              await this.resetAppContent();
+              return;
+            }
+          } else {
+            // LiveMode外: 即座にリセット
+            console.log('[Foreground] Long background duration - triggering soft reset...');
+            await this.resetAppContent();
+            return;
+          }
         }
 
         // 2. UI状態をリセット（操作可能にする）
@@ -265,6 +300,7 @@ export class CoreController {
     // ★案A: live_resume成功
     this.socket.on('live_resumed', (data: any) => {
       console.log('[LiveAPI] セッション再開成功:', data?.session_id);
+      this._liveResumeSucceeded = true;
     });
 
     // ★案A: live_resume失敗 → 新規セッション開始にフォールバック
