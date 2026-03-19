@@ -1023,6 +1023,9 @@ class LiveAPISession:
 
     async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int):
         """収集済み音声を前半と同じストリーミング方式で送信（テスト: A2E先行方式廃止）"""
+        # ★ A2Eリセット: フロントのfirstChunkStartTimeを0に戻す（ショップ間セグメント切替）
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
+
         if transcript:
             logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
             self._add_to_history("ai", transcript)
