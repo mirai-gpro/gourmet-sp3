@@ -301,6 +301,13 @@ export class CoreController {
       }
     });
 
+    // ★ A2E expressionリセット（仕様書V6 §5.2: 新音声セグメント開始前）
+    this.socket.on('live_expression_reset', () => {
+      if (!this.isLiveMode) return;
+      console.log('[A2E] live_expression_reset受信');
+      this.liveAudioManager.onAiResponseEnded();
+    });
+
     this.socket.on('user_transcript', (data: any) => {
       if (!this.isLiveMode) return;
       const text = data.text;
