@@ -801,6 +801,10 @@ class LiveAPISession:
             # 「お待たせしました」音声をA2Eパイプライン経由で再生
             await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
 
+            # ★ 音声再生完了を待ってから次のセグメントへ（A2E同期崩壊防止）
+            if _CACHED_ANNOUNCE_PCM:
+                await asyncio.sleep(len(_CACHED_ANNOUNCE_PCM) / 48000)
+
             # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
             await self._describe_shops_via_live(shops)
 
@@ -873,6 +877,12 @@ class LiveAPISession:
         # ── 1軒目: 即座にストリーミング再生 ──
         await self._stream_single_shop(shops[0], 1, total)
 
+        # ★ 1軒目の残り音声再生完了を待つ（A2E同期崩壊防止）
+        if hasattr(self, '_last_stream_pcm_bytes') and self._last_stream_pcm_bytes > 0:
+            stream_duration = self._last_stream_pcm_bytes / 48000
+            logger.info(f"[ShopDesc] 1軒目再生待ち: {stream_duration:.1f}秒")
+            await asyncio.sleep(stream_duration)
+
         # ── 2軒目以降: 生成済み音声を順次再生 ──
         for i, task in enumerate(remaining_tasks):
             if not self.is_running:
@@ -881,6 +891,11 @@ class LiveAPISession:
                 audio_chunks, transcript = await task
                 if audio_chunks:
                     await self._emit_collected_shop(audio_chunks, transcript, i + 2)
+                    # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
+                    all_pcm = b''.join(audio_chunks)
+                    audio_duration = len(all_pcm) / 48000
+                    logger.info(f"[ShopDesc] ショップ{i+2}再生待ち: {audio_duration:.1f}秒")
+                    await asyncio.sleep(audio_duration)
             except Exception as e:
                 logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
@@ -1036,6 +1051,7 @@ class LiveAPISession:
         ショップ説明専用の応答受信（v5 §6.2）
         turn_completeまで受信して終了。
         """
+        self._last_stream_pcm_bytes = 0  # ★ ストリーミング送信バイト数累計
         turn = session.receive()
         async for response in turn:
             if not self.is_running:
@@ -1087,6 +1103,8 @@ class LiveAPISession:
                                                    room=self.client_sid)
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
+                                # ★ ストリーミング送信バイト数累計（動的sleep用）
+                                self._last_stream_pcm_bytes += len(part.inline_data.data)
 
     # ============================================================
     # キャッシュ済み音声再生（A2Eパイプライン経由）
