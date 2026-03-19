@@ -726,12 +726,15 @@ class LiveAPISession:
                                    room=self.client_sid)
 
                 # 0.5秒後「お店をお探ししますね」+ 6.5秒後「只今…確認中です」を並行起動
-                searching_task = asyncio.ensure_future(
-                    self._delayed_cached_audio(_CACHED_SEARCHING_PCM, delay=0.5)
-                )
-                please_wait_task = asyncio.ensure_future(
-                    self._delayed_cached_audio(_CACHED_PLEASE_WAIT_PCM, delay=6.5)
-                )
+                # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
+                # searching_task = asyncio.ensure_future(
+                #     self._delayed_cached_audio(_CACHED_SEARCHING_PCM, delay=0.5)
+                # )
+                # please_wait_task = asyncio.ensure_future(
+                #     self._delayed_cached_audio(_CACHED_PLEASE_WAIT_PCM, delay=6.5)
+                # )
+                searching_task = asyncio.ensure_future(asyncio.sleep(0))
+                please_wait_task = asyncio.ensure_future(asyncio.sleep(0))
 
                 # ショップ検索を実行
                 await self._handle_shop_search(user_request)
