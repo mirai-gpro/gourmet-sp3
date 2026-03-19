@@ -884,9 +884,6 @@ class LiveAPISession:
             except Exception as e:
                 logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
-        # A2E: 全ショップ完了後にexpressionリセット
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
-
         # 全ショップ説明完了 → 通常会話に復帰
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
         self._add_to_history("ai", summary)
@@ -924,9 +921,6 @@ class LiveAPISession:
                 model=LIVE_API_MODEL,
                 config=config
             ) as session:
-                # A2E: 新音声セグメント開始前にexpressionリセット
-                self.socketio.emit('live_expression_reset', room=self.client_sid)
-
                 trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
                 await session.send_client_content(
                     turns=types.Content(
@@ -1014,9 +1008,6 @@ class LiveAPISession:
             logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
             self._add_to_history("ai", transcript)
 
-        # A2E: 新音声セグメント開始前にexpressionリセット
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
-
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
             self.socketio.emit('live_audio', {'data': audio_b64},
@@ -1095,9 +1086,6 @@ class LiveAPISession:
         if not pcm_data:
             logger.warning("[CachedAudio] PCMデータなし、スキップ")
             return
-
-        # A2E: 新音声セグメント開始前にexpressionリセット
-        self.socketio.emit('live_expression_reset', room=self.client_sid)
 
         # PCMをチャンク分割してlive_audioで送信（LiveAPIと同じ形式）
         CHUNK_SIZE = 4800  # 0.1秒分 (24kHz 16bit mono)
