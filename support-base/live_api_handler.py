@@ -924,8 +924,9 @@ class LiveAPISession:
                 model=LIVE_API_MODEL,
                 config=config
             ) as session:
-                # A2E: 新音声セグメント開始前にexpressionリセット
+                # A2E: 新音声セグメント開始前にexpressionリセット（仕様書12 §3.1.4）
                 self.socketio.emit('live_expression_reset', room=self.client_sid)
+                await asyncio.sleep(0.03)  # リセットがフロントで処理される時間マージン
 
                 trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
                 await session.send_client_content(
@@ -1009,24 +1010,26 @@ class LiveAPISession:
         return audio_chunks, transcript
 
     async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int):
-        """収集済み音声をブラウザに順次送信（A2E付き）"""
+        """収集済み音声をA2E先行+sleep方式で送信（仕様書12 §3.1.2）"""
         if transcript:
             logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
             self._add_to_history("ai", transcript)
 
-        # A2E: 新音声セグメント開始前にexpressionリセット
+        # 1. expressionリセット → フロントのバッファクリア
         self.socketio.emit('live_expression_reset', room=self.client_sid)
 
+        # 2. A2E先行: 全音声チャンクを結合してA2Eに一括送信
+        all_pcm = b''.join(audio_chunks)
+        await self._send_a2e_ahead(all_pcm)
+
+        # 3. sleep: Expressionがフロントのバッファに格納される時間マージン
+        await asyncio.sleep(0.05)
+
+        # 4. 音声送信: Expressionが既にバッファにある状態で再生開始
         for chunk in audio_chunks:
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
             self.socketio.emit('live_audio', {'data': audio_b64},
                                room=self.client_sid)
-            # ★ A2E: リップシンク用バッファ蓄積
-            self._buffer_for_a2e(chunk)
-
-        # A2E: 残存バッファをフラッシュ
-        await self._flush_a2e_buffer(force=True, is_final=True)
-        self._a2e_chunk_index = 0
 
     async def _receive_shop_description(self, session, shop_number: int):
         """
@@ -1090,28 +1093,36 @@ class LiveAPISession:
     # ============================================================
 
     async def _emit_cached_audio(self, pcm_data: bytes | None):
-        """キャッシュ済みPCM音声をlive_audio + A2Eパイプラインで送信
-        _emit_collected_shop() と同じパターン"""
+        """キャッシュ済みPCM音声をA2E先行+sleep方式で送信（仕様書12 §3.1.1）
+
+        公式デモの「全データ揃ってから再生」パターン:
+        1. expressionリセット → フロントのバッファクリア
+        2. A2E先行送信 → Expressionをフロントに先着させる
+        3. sleep → Expressionがバッファに格納される時間マージン
+        4. 音声送信 → Expressionが既にバッファにある状態で再生開始
+        """
         if not pcm_data:
             logger.warning("[CachedAudio] PCMデータなし、スキップ")
             return
 
-        # A2E: 新音声セグメント開始前にexpressionリセット
+        # 1. expressionリセット → フロントのバッファクリア
         self.socketio.emit('live_expression_reset', room=self.client_sid)
 
-        # PCMをチャンク分割してlive_audioで送信（LiveAPIと同じ形式）
+        # 2. A2E先行: 全音声を一括でA2Eに送信し、Expressionを先にフロントへ届ける
+        await self._send_a2e_ahead(pcm_data)
+
+        # 3. sleep: Expressionがフロントのバッファに格納される時間マージン
+        await asyncio.sleep(0.05)
+
+        # 4. 音声送信: Expressionが既にバッファにある状態で再生開始
         CHUNK_SIZE = 4800  # 0.1秒分 (24kHz 16bit mono)
         for i in range(0, len(pcm_data), CHUNK_SIZE):
             chunk = pcm_data[i:i + CHUNK_SIZE]
             audio_b64 = base64.b64encode(chunk).decode('utf-8')
             self.socketio.emit('live_audio', {'data': audio_b64},
                                room=self.client_sid)
-            self._buffer_for_a2e(chunk)
 
-        # A2E: 残存バッファをフラッシュ
-        await self._flush_a2e_buffer(force=True, is_final=True)
-        self._a2e_chunk_index = 0
-        logger.info(f"[CachedAudio] 再生完了: {len(pcm_data)} bytes")
+        logger.info(f"[CachedAudio] A2E先行+再生完了: {len(pcm_data)} bytes")
 
     async def _delayed_cached_audio(self, pcm_data: bytes | None, delay: float):
         """指定秒数待機後にキャッシュ済み音声を再生"""
@@ -1141,6 +1152,23 @@ class LiveAPISession:
         if any(t in text for t in flush_triggers):
             asyncio.ensure_future(self._flush_a2e_buffer(force=False))
             self._a2e_transcript_buffer = ""
+
+    async def _send_a2e_ahead(self, pcm_data: bytes):
+        """A2E先行送信: 音声をフロントに送る前にExpressionを先に届ける
+
+        公式デモの「推論完了 → 全データ揃ってから再生」パターンの再現。
+        _buffer_for_a2e() + _flush_a2e_buffer() の一括実行版。
+        仕様書12 §3.1.3
+        """
+        # chunk_indexリセット（新セグメント）
+        self._a2e_chunk_index = 0
+        self._a2e_audio_buffer = bytearray()
+
+        # 一括でA2Eに送信（is_start=True, is_final=True）
+        await self._send_to_a2e(pcm_data, chunk_index=0, is_final=True)
+
+        # chunk_indexを1に進める（次のフラッシュがis_start=Falseになるように）
+        self._a2e_chunk_index = 1
 
     async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False):
         """最低バイト数チェック後、非同期でA2E送信（仕様書08 セクション3.3）"""

@@ -330,6 +330,33 @@ export class LiveAudioManager {
         this.isAiSpeaking = true;
     }
 
+    /**
+     * 新音声セグメント開始前のリセット（live_expression_reset用）（仕様書12 §6.2）
+     *
+     * A2E先行方式: resetForNewSegment() → live_expression → live_audio の順で到着するため、
+     * isAiSpeaking = true を維持して onAiResponseStarted() のリセットを抑制し、
+     * A2E先行で追加されたExpressionフレームを保持する。
+     */
+    resetForNewSegment(): void {
+        // 再生キューをクリア（前セグメントの残音声を停止）
+        this.nextPlayTime = 0;
+        for (const source of this.scheduledSources) {
+            try { source.stop(); } catch (_) { /* already stopped */ }
+        }
+        this.scheduledSources = [];
+
+        // Expressionバッファクリア + タイムスタンプリセット
+        this.expressionFrameBuffer = [];
+        this.firstChunkStartTime = 0;
+
+        // ★ isAiSpeaking = true を維持
+        // → 次の live_audio で onAiResponseStarted() のリセットが走らない
+        // → A2E先行で追加されたフレームが保持される
+        this.isAiSpeaking = true;
+
+        console.log('[LiveAudioManager] resetForNewSegment: バッファクリア, isAiSpeaking=true維持');
+    }
+
     onAiResponseEnded(): void {
         this.isAiSpeaking = false;
     }

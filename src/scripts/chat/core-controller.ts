@@ -301,11 +301,11 @@ export class CoreController {
       }
     });
 
-    // ★ A2E expressionリセット（仕様書V6 §5.2: 新音声セグメント開始前）
+    // ★ A2E expressionリセット（仕様書12 §6.2: A2E先行方式対応）
     this.socket.on('live_expression_reset', () => {
       if (!this.isLiveMode) return;
       console.log('[A2E] live_expression_reset受信');
-      this.liveAudioManager.onAiResponseEnded();
+      this.liveAudioManager.resetForNewSegment();
     });
 
     this.socket.on('user_transcript', (data: any) => {
