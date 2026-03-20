@@ -114,6 +114,30 @@ export class LAMWebSocketManager {
             result[this.expressionNames[i]] = values[i];
         }
 
+        // === STEP1: 日本語口形補正 ===
+        // 案B: 静的スケーリング（全体適用）
+        const JP_SCALING: Record<string, number> = {
+            'mouthStretchLeft':  1.3,
+            'mouthStretchRight': 1.3,
+            'jawOpen':           0.85,
+            'mouthFunnel':       1.1,
+            'mouthPucker':       1.1,
+        };
+        for (const [name, scale] of Object.entries(JP_SCALING)) {
+            if (result[name] !== undefined) {
+                result[name] = Math.min(1.0, result[name] * scale);
+            }
+        }
+
+        // 案A: ブレンドシェイプ間の関係制約（イ/エ系でjawOpen追加抑制）
+        const stretchL = result['mouthStretchLeft'] ?? 0;
+        const stretchR = result['mouthStretchRight'] ?? 0;
+        const avgStretch = (stretchL + stretchR) / 2;
+        if (avgStretch > 0.2) {
+            const suppressionFactor = 1.0 - avgStretch * 0.5;
+            result['jawOpen'] *= Math.max(0.3, suppressionFactor);
+        }
+
         // デバッグ: 120フレームごと（約2秒）にログ出力
         this._exprDebugCounter++;
         if (this._exprDebugCounter % 120 === 0) {
