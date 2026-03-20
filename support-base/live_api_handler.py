@@ -878,6 +878,11 @@ class LiveAPISession:
             )
             remaining_tasks.append(task)
 
+        # ── 1軒目開始前: A2Eリセット（FC発火時にturn_completeが来ないため）──
+        self.socketio.emit('live_expression_reset', room=self.client_sid)
+        self._a2e_chunk_index = 0
+        self._a2e_audio_buffer = bytearray()
+
         # ── 1軒目: 即座にストリーミング再生 ──
         await self._stream_single_shop(shops[0], 1, total)
 
