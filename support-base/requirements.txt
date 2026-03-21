@@ -5,31 +5,31 @@ flask-socketio==5.3.5
 python-socketio==5.10.0
 
 # Gemini / LLM（正式SDK・検索対応）
-google-genai>=0.3.0
-google-generativeai>=0.8.0
+google-genai==1.68.0
+google-generativeai==0.8.6
 
 # Google Cloud Services
 google-cloud-firestore==2.18.0
 google-cloud-storage==2.18.2
-google-cloud-texttospeech>=2.14.0
-google-cloud-speech>=2.21.0
+google-cloud-texttospeech==2.34.0
+google-cloud-speech==2.37.0
 
 # Web Server
 gunicorn==21.2.0
 
 # HTTP Client & Utilities
-httpx>=0.25.0
-requests>=2.31.0
+httpx==0.28.1
+requests==2.32.5
 
 # Text Encoding Fix (文字化け修正)
-ftfy>=6.1.0
+ftfy==6.3.1
 
 # Long-term Memory (Supabase)
-supabase>=2.0.0
+supabase==2.28.3
 
 # A2E (Audio2Expression) リサンプリング
-scipy>=1.11.0
-numpy>=1.24.0
+scipy==1.17.1
+numpy==2.4.3
 
 # （将来用：残していても問題なし）
-anthropic>=0.25.0
+anthropic==0.86.0
