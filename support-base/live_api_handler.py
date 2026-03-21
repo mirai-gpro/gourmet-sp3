@@ -907,9 +907,9 @@ class LiveAPISession:
             if not self.is_running:
                 break
             try:
-                audio_chunks, transcript = await task
+                audio_chunks, transcript, a2e_result = await task
                 if audio_chunks:
-                    await self._emit_collected_shop(audio_chunks, transcript, i + 2)
+                    await self._emit_collected_shop(audio_chunks, transcript, i + 2, a2e_result)
                     # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
                     all_pcm = b''.join(audio_chunks)
                     audio_duration = len(all_pcm) / 48000
@@ -1034,9 +1034,16 @@ class LiveAPISession:
                                 audio_chunks.append(part.inline_data.data)
 
         logger.info(f"[ShopDesc] ショップ{shop_number}並行生成完了: {len(audio_chunks)}チャンク, {len(transcript)}文字")
-        return audio_chunks, transcript
 
-    async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int):
+        # A2E事前計算: 1軒目再生中にリサンプリング＋HTTP往復を完了させる
+        a2e_result = None
+        if audio_chunks:
+            all_pcm = b''.join(audio_chunks)
+            a2e_result = await self._precompute_a2e_expressions(all_pcm)
+
+        return audio_chunks, transcript, a2e_result
+
+    async def _emit_collected_shop(self, audio_chunks: list, transcript: str, shop_number: int, a2e_result: dict | None = None):
         """収集済み音声をA2E先行方式で送信（_emit_cached_audioと同パターン）"""
         if transcript:
             logger.info(f"[ShopDesc] ショップ{shop_number}: {transcript}")
@@ -1048,7 +1055,18 @@ class LiveAPISession:
         self.socketio.emit('live_expression_reset', room=self.client_sid)
 
         # 2. A2E先行: Expressionをフロントに先着させる
-        await self._send_a2e_ahead(all_pcm)
+        if a2e_result:
+            # 事前計算済み: emitのみ（HTTP待ちなし）
+            self.socketio.emit('live_expression', {
+                'expressions': a2e_result['expressions'],
+                'expression_names': a2e_result['expression_names'],
+                'frame_rate': a2e_result['frame_rate'],
+                'chunk_index': 0,
+            }, room=self.client_sid)
+            logger.info(f"[A2E] ショップ{shop_number}: 事前計算済みexpression emit ({len(a2e_result['expressions'])} frames)")
+        else:
+            # 事前計算失敗時: 従来通りHTTP呼び出し
+            await self._send_a2e_ahead(all_pcm)
 
         # 3. sleep: Expressionがフロントのバッファに格納される時間マージン
         await asyncio.sleep(0.05)
@@ -1200,6 +1218,49 @@ class LiveAPISession:
 
         # chunk_indexを1に進める（次のフラッシュがis_start=Falseになるように）
         self._a2e_chunk_index = 1
+
+    async def _precompute_a2e_expressions(self, pcm_data: bytes) -> dict | None:
+        """A2E事前計算: リサンプリング＋HTTP POSTでexpressionデータを取得（emitしない）
+
+        _collect_shop_audio() から呼ばれる。インスタンス変数（_a2e_chunk_index等）に
+        触れず、フロントエンドへのemitも行わない。純粋な計算＋API呼び出しのみ。
+        """
+        try:
+            int16_array = np.frombuffer(pcm_data, dtype=np.int16)
+            resampled = resample_poly(int16_array.astype(np.float32), up=2, down=3)
+            int16_resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+            audio_b64 = base64.b64encode(int16_resampled.tobytes()).decode('utf-8')
+
+            response = await self._a2e_http_client.post(
+                f"{A2E_SERVICE_URL}/api/audio2expression",
+                json={
+                    "audio_base64": audio_b64,
+                    "session_id": self.session_id,
+                    "audio_format": "pcm",
+                    "is_start": True,
+                    "is_final": True,
+                },
+                timeout=10.0
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                frames = result.get('frames', [])
+                names = result.get('names', [])
+                frame_rate = result.get('frame_rate', A2E_EXPRESSION_FPS)
+                if frames:
+                    expressions = [f['weights'] if isinstance(f, dict) else f for f in frames]
+                    logger.info(f"[A2E] 事前計算完了: {len(frames)} frames")
+                    return {
+                        'expressions': expressions,
+                        'expression_names': names,
+                        'frame_rate': frame_rate,
+                    }
+            else:
+                logger.warning(f"[A2E] 事前計算エラー: {response.status_code}")
+        except Exception as e:
+            logger.error(f"[A2E] 事前計算エラー: {e}")
+        return None
 
     async def _flush_a2e_buffer(self, force: bool = False, is_final: bool = False):
         """最低バイト数チェック後、非同期でA2E送信（仕様書08 セクション3.3）"""
