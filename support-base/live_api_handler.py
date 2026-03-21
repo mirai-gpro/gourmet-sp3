@@ -14,6 +14,7 @@ import base64
 import os
 import logging
 import struct
+import time
 import httpx
 from scipy.signal import resample_poly
 import numpy as np
@@ -901,7 +902,12 @@ class LiveAPISession:
         next_a2e_task = None
         if hasattr(self, '_last_stream_pcm_bytes') and self._last_stream_pcm_bytes > 0:
             stream_duration = self._last_stream_pcm_bytes / 48000
-            logger.info(f"[ShopDesc] 1軒目再生待ち: {stream_duration:.1f}秒")
+            # ストリーミング中にブラウザ再生が進んでいるので、残り再生時間で待つ
+            elapsed = 0.0
+            if hasattr(self, '_stream_start_time') and self._stream_start_time:
+                elapsed = time.time() - self._stream_start_time
+            remaining_sleep = max(stream_duration - elapsed + 0.3, 0.5)  # 0.3秒マージン、最低0.5秒
+            logger.info(f"[ShopDesc] 1軒目再生待ち: 全長{stream_duration:.1f}秒, 経過{elapsed:.1f}秒, sleep{remaining_sleep:.1f}秒")
 
             # 2軒目のA2E事前計算をsleep待ち中に開始
             if remaining_tasks:
@@ -912,7 +918,7 @@ class LiveAPISession:
                         self._precompute_a2e_expressions(all_pcm)
                     )
 
-            await asyncio.sleep(stream_duration)
+            await asyncio.sleep(remaining_sleep)
 
         # ── 2軒目以降: 生成済み音声を順次再生 ──
         # NOTE: asyncio.Taskは複数回awaitしても同じ結果を返す（キャッシュ）
@@ -1108,6 +1114,7 @@ class LiveAPISession:
         turn_completeまで受信して終了。
         """
         self._last_stream_pcm_bytes = 0  # ★ ストリーミング送信バイト数累計
+        self._stream_start_time = None  # ★ 最初の音声チャンク送信時刻
         turn = session.receive()
         async for response in turn:
             if not self.is_running:
@@ -1160,6 +1167,8 @@ class LiveAPISession:
                                 # ★ A2E: ショップ説明でも蓄積（仕様書08 セクション3.5）
                                 self._buffer_for_a2e(part.inline_data.data)
                                 # ★ ストリーミング送信バイト数累計（動的sleep用）
+                                if self._stream_start_time is None:
+                                    self._stream_start_time = time.time()
                                 self._last_stream_pcm_bytes += len(part.inline_data.data)
 
     # ============================================================
