@@ -952,7 +952,7 @@ class LiveAPISession:
                                 self._precompute_a2e_expressions(next_all_pcm)
                             )
 
-                    await asyncio.sleep(audio_duration)
+                    await asyncio.sleep(audio_duration + 0.3)
             except Exception as e:
                 logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
