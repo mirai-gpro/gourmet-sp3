@@ -896,17 +896,6 @@ class LiveAPISession:
         # ── 1軒目: 即座にストリーミング再生 ──
         await self._stream_single_shop(shops[0], 1, total)
 
-        # ── 2軒目以降の音声収集結果を先に全て回収 ──
-        # （音声生成は既に並行実行中。A2E事前計算はまだ行わない）
-        collected = []  # [(audio_chunks, transcript), ...]
-        for i, task in enumerate(remaining_tasks):
-            try:
-                audio_chunks, transcript = await task
-                collected.append((audio_chunks, transcript))
-            except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
-                collected.append(([], ""))
-
         # ★ 1軒目の残り音声再生完了を待つ（A2E同期崩壊防止）
         # 待ち時間中に2軒目のA2E事前計算を実行（1軒目A2Eストリーミング完了後なので競合しない）
         next_a2e_task = None
@@ -915,21 +904,23 @@ class LiveAPISession:
             logger.info(f"[ShopDesc] 1軒目再生待ち: {stream_duration:.1f}秒")
 
             # 2軒目のA2E事前計算をsleep待ち中に開始
-            if collected and collected[0][0]:
-                all_pcm = b''.join(collected[0][0])
-                next_a2e_task = asyncio.create_task(
-                    self._precompute_a2e_expressions(all_pcm)
-                )
+            if remaining_tasks:
+                audio_chunks, transcript = await remaining_tasks[0]
+                if audio_chunks:
+                    all_pcm = b''.join(audio_chunks)
+                    next_a2e_task = asyncio.create_task(
+                        self._precompute_a2e_expressions(all_pcm)
+                    )
 
             await asyncio.sleep(stream_duration)
 
-        # ── 2軒目以降: 順次再生。N軒目再生中にN+1軒目のA2E事前計算 ──
-        for i, (audio_chunks, transcript) in enumerate(collected):
+        # ── 2軒目以降: 生成済み音声を順次再生 ──
+        # NOTE: asyncio.Taskは複数回awaitしても同じ結果を返す（キャッシュ）
+        for i, task in enumerate(remaining_tasks):
             if not self.is_running:
                 break
             try:
-                if not audio_chunks:
-                    continue
+                audio_chunks, transcript = await task
 
                 # このショップのA2E事前計算結果を取得
                 a2e_result = None
@@ -937,24 +928,27 @@ class LiveAPISession:
                     a2e_result = await next_a2e_task
                     next_a2e_task = None
 
-                await self._emit_collected_shop(audio_chunks, transcript, i + 2, a2e_result)
+                if audio_chunks:
+                    await self._emit_collected_shop(audio_chunks, transcript, i + 2, a2e_result)
 
-                # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
-                # 待ち時間中に次のショップのA2E事前計算を実行
-                all_pcm = b''.join(audio_chunks)
-                audio_duration = len(all_pcm) / 48000
-                logger.info(f"[ShopDesc] ショップ{i+2}再生待ち: {audio_duration:.1f}秒")
+                    # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
+                    # 待ち時間中に次のショップのA2E事前計算を実行
+                    all_pcm = b''.join(audio_chunks)
+                    audio_duration = len(all_pcm) / 48000
+                    logger.info(f"[ShopDesc] ショップ{i+2}再生待ち: {audio_duration:.1f}秒")
 
-                # 次のショップのA2E事前計算をsleep待ち中に開始
-                if i + 1 < len(collected) and collected[i + 1][0]:
-                    next_all_pcm = b''.join(collected[i + 1][0])
-                    next_a2e_task = asyncio.create_task(
-                        self._precompute_a2e_expressions(next_all_pcm)
-                    )
+                    # 次のショップのA2E事前計算をsleep待ち中に開始
+                    if i + 1 < len(remaining_tasks):
+                        next_chunks, _ = await remaining_tasks[i + 1]
+                        if next_chunks:
+                            next_all_pcm = b''.join(next_chunks)
+                            next_a2e_task = asyncio.create_task(
+                                self._precompute_a2e_expressions(next_all_pcm)
+                            )
 
-                await asyncio.sleep(audio_duration)
+                    await asyncio.sleep(audio_duration)
             except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{i+2}再生エラー: {e}")
+                logger.error(f"[ShopDesc] ショップ{i+2}並行生成エラー: {e}")
 
         # 全ショップ説明完了 → 通常会話に復帰
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
