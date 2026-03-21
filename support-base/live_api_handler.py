@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-  # deploy trigger
+# -*- coding: utf-8 -*-
 """
 Gemini LiveAPI ハンドラ（WebSocket プロキシ）
 stt_stream.py の GeminiLiveApp をWebアプリ向けに改変
@@ -774,14 +774,13 @@ class LiveAPISession:
 
     async def _handle_shop_search(self, user_request: str):
         """
-        ショップ検索を実行し、結果をブラウザに送信する（案A: enrich並行方式）
+        ショップ検索を実行し、結果をブラウザに送信する（v5 §5.5）
 
         【設計】
-        - callbackでLLM JSON生成のみ（enrichなし）→ raw_shopsを取得
-        - raw_shopsで即座にTTS並行生成を開始
-        - enrichをTTS生成と並行でrun_in_executor実行
-        - enrich完了後にショップカードをブラウザに送信
-        - TTS再生（生成済みタスクを_describe_shops_via_liveに渡す）
+        - shop_search_callback を呼び出してショップデータを取得
+        - コールバックは SupportAssistant.process_user_message() を内部的に呼び出す
+        - 取得したデータはshop_search_resultイベントでブラウザに送信
+        - エラー時・空結果時もshop_search_resultを送信してフロントの待機を解除
         """
         if not self._shop_search_callback:
             logger.error("[ShopSearch] shop_search_callback が未設定")
@@ -791,7 +790,7 @@ class LiveAPISession:
             return
 
         try:
-            # 1. callbackでLLM JSON生成（enrichなし）
+            # ★ 同期ブロッキング呼び出しをイベントループ外で実行
             loop = asyncio.get_event_loop()
             shop_data = await loop.run_in_executor(
                 None,
@@ -806,39 +805,27 @@ class LiveAPISession:
                 }, room=self.client_sid)
                 return
 
-            raw_shops = shop_data['shops']
+            shops = shop_data['shops']
             response_text = shop_data.get('response', '')
-            area = shop_data.get('area', '')
 
-            # 2. ★ TTS並行生成を即開始（enrich前のraw_shopsで）
-            import copy
-            tts_shops = copy.deepcopy(raw_shops)
-            total = len(tts_shops)
-            all_tts_tasks = []
-            for i in range(total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(tts_shops[i], i + 1, total)
-                )
-                all_tts_tasks.append(task)
-            logger.info(f"[ShopSearch] ★ TTS {total}軒の並行生成を開始（enrich前）")
-
-            # 3. ★ enrichをTTS生成と並行実行
-            from api_integrations import enrich_shops_with_photos
-            enriched = await loop.run_in_executor(
-                None, enrich_shops_with_photos, raw_shops, area, self.language
-            )
-            shops = enriched if enriched else raw_shops
-            logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
-
-            # 4. ショップカードデータをブラウザに送信
+            # ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
                 'shops': shops,
                 'response': response_text,
             }, room=self.client_sid)
+
             logger.info(f"[ShopSearch] {len(shops)}件のショップをブラウザに送信")
 
-            # 5. TTS再生（生成済みタスクを渡す）
-            await self._describe_shops_via_live(shops, pre_generated_tasks=all_tts_tasks)
+            # 「お待たせしました」音声をA2Eパイプライン経由で再生
+            # ★ テスト: キャッシュ音声を無効化（A2Eバッファ汚染の切り分け）
+            # await self._emit_cached_audio(_CACHED_ANNOUNCE_PCM)
+            #
+            # # ★ 音声再生完了を待ってから次のセグメントへ（A2E同期崩壊防止）
+            # if _CACHED_ANNOUNCE_PCM:
+            #     await asyncio.sleep(len(_CACHED_ANNOUNCE_PCM) / 48000)
+
+            # ショップ説明をLiveAPIで1軒ずつ読み上げ（v5 §6）
+            await self._describe_shops_via_live(shops)
 
         except Exception as e:
             logger.error(f"[ShopSearch] エラー: {e}", exc_info=True)
@@ -885,62 +872,41 @@ class LiveAPISession:
                 logger.info("[LiveAPI] 累積制限到達のため再接続")
                 self.needs_reconnect = True
 
-    async def _describe_shops_via_live(self, shops: list, pre_generated_tasks: list = None):
+    async def _describe_shops_via_live(self, shops: list):
         """
-        ショップ説明をLiveAPIで読み上げ（案A: enrich並行方式対応）
+        ショップ説明をLiveAPIで読み上げ（v7 全ショップ統一方式）
 
-        【フロー】
-        - pre_generated_tasks が渡された場合: TTS生成済みタスクを使用（案A）
-        - 渡されない場合: 従来通りここでTTS並行生成を開始
-        - bridge → please_wait のキャッシュ音声を連続再生で時間を稼ぐ
-        - 1軒目collect完了後、A2E事前計算 → emit
-        - 全ショップ統一のcollect+precompute A2E方式でリップシンク品質を均一化
+        【改善】
+        - 場繋ぎメッセージで1軒目までの空白を埋める
+        - 全ショップ（1軒目含む）を _collect_shop_audio + _emit_collected_shop で統一
+        - 1軒目も2軒目以降と同じ一括A2E事前計算 → 高品質リップシンク
         """
         total = len(shops)
         if total == 0:
             return
 
-        # ── TTS生成タスク: 事前生成済みならそれを使う、なければここで開始 ──
-        if pre_generated_tasks:
-            all_tasks = pre_generated_tasks
-            logger.info(f"[ShopDesc] 事前生成済みTTSタスク {len(all_tasks)}件を使用")
-        else:
-            all_tasks = []
-            for i in range(total):
-                task = asyncio.create_task(
-                    self._collect_shop_audio(shops[i], i + 1, total)
-                )
-                all_tasks.append(task)
+        # ── 全ショップ（1軒目含む）の並行生成を即座に開始 ──
+        all_tasks = []
+        for i in range(total):
+            task = asyncio.create_task(
+                self._collect_shop_audio(shops[i], i + 1, total)
+            )
+            all_tasks.append(task)
 
-        # ── A2Eリセット ──
+        # ── 場繋ぎ: バッファ再生（A2E先行方式）──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
 
-        # ── 場繋ぎ: bridge → please_wait を連続再生（約8-9秒）──
         bridge_start = time.time()
-        total_bridge_duration = 0.0
+        bridge_pcm = _CACHED_BRIDGE_PCM
+        bridge_duration = 0.0
+        if bridge_pcm:
+            await self._emit_cached_audio(bridge_pcm)
+            bridge_duration = len(bridge_pcm) / 48000
+            logger.info(f"[ShopDesc] 場繋ぎ再生開始: {bridge_duration:.1f}秒")
 
-        # 1) bridge: コメントアウト（A2Eバッファ衝突切り分け）
-        # if _CACHED_BRIDGE_PCM:
-        #     await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
-        #     dur = len(_CACHED_BRIDGE_PCM) / 48000
-        #     total_bridge_duration += dur
-        #     logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
-
-        # bridge再生完了を待ってからplease_waitへ
-        elapsed = time.time() - bridge_start
-        wait1 = max(total_bridge_duration - elapsed + 0.3, 0.3)
-        await asyncio.sleep(wait1)
-
-        # 2) please_wait: コメントアウト（A2Eバッファ衝突切り分け）
-        # if _CACHED_PLEASE_WAIT_PCM:
-        #     await self._emit_cached_audio(_CACHED_PLEASE_WAIT_PCM)
-        #     dur = len(_CACHED_PLEASE_WAIT_PCM) / 48000
-        #     total_bridge_duration += dur
-        #     logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
-
-        # ── 場繋ぎ再生中に1軒目のcollect完了を待つ + A2E事前計算 ──
+        # ── 場繋ぎ再生中に1軒目の収集完了待ち + A2E事前計算 ──
         next_a2e_task = None
         audio_chunks_1, transcript_1 = await all_tasks[0]
         if audio_chunks_1:
@@ -948,13 +914,13 @@ class LiveAPISession:
                 self._precompute_a2e_expressions(b''.join(audio_chunks_1))
             )
 
-        # please_wait再生完了を待つ
+        # 場繋ぎ再生完了を待つ
         elapsed = time.time() - bridge_start
-        remaining_sleep = max(total_bridge_duration - elapsed + 0.3, 0.5)
-        logger.info(f"[ShopDesc] 場繋ぎ残り待ち: {remaining_sleep:.1f}秒 (経過{elapsed:.1f}秒, 場繋ぎ合計{total_bridge_duration:.1f}秒)")
+        remaining_sleep = max(bridge_duration - elapsed + 0.3, 0.5)
+        logger.info(f"[ShopDesc] 場繋ぎ残り待ち: {remaining_sleep:.1f}秒 (経過{elapsed:.1f}秒)")
         await asyncio.sleep(remaining_sleep)
 
-        # ── 全ショップ: collect済み音声を順次再生（1軒目も同じパス）──
+        # ── 全ショップ: 生成済み音声を順次再生（1軒目も同じパス）──
         for i, task in enumerate(all_tasks):
             if not self.is_running:
                 break
@@ -971,6 +937,7 @@ class LiveAPISession:
                     await self._emit_collected_shop(audio_chunks, transcript, i + 1, a2e_result)
 
                     # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
+                    # 待ち時間中に次のショップのA2E事前計算を実行
                     all_pcm = b''.join(audio_chunks)
                     audio_duration = len(all_pcm) / 48000
                     logger.info(f"[ShopDesc] ショップ{i+1}再生待ち: {audio_duration:.1f}秒")
