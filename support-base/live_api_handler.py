@@ -921,12 +921,12 @@ class LiveAPISession:
         bridge_start = time.time()
         total_bridge_duration = 0.0
 
-        # 1) bridge: コメントアウト（A2Eバッファ衝突切り分け）
-        # if _CACHED_BRIDGE_PCM:
-        #     await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
-        #     dur = len(_CACHED_BRIDGE_PCM) / 48000
-        #     total_bridge_duration += dur
-        #     logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
+        # 1) bridge: 「お待たせしました。それではお薦めのお店をご紹介します。」
+        if _CACHED_BRIDGE_PCM:
+            await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
+            dur = len(_CACHED_BRIDGE_PCM) / 48000
+            total_bridge_duration += dur
+            logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
 
         # bridge再生完了を待ってからplease_waitへ
         elapsed = time.time() - bridge_start
