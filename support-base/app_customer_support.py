@@ -803,11 +803,9 @@ def handle_live_start(data):
             result = assistant.process_user_message(search_message, 'conversation')
             if result.get('shops'):
                 session.add_message('model', result['response'], 'chat')
-                # REST版と同様にPlaces APIで写真・評価・URL等を補完
+                # ★ 案A: enrichはlive_api_handler側でTTS生成と並行実行するため、ここではareaのみ返す
                 area = extract_area_from_text(user_request, lang)
-                enriched = enrich_shops_with_photos(result['shops'], area, lang)
-                if enriched:
-                    result['shops'] = enriched
+                result['area'] = area
             return result
         except Exception as e:
             logger.error(f"[ShopSearch] コールバックエラー: {e}", exc_info=True)
