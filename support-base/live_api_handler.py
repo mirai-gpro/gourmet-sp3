@@ -874,125 +874,92 @@ class LiveAPISession:
 
     async def _describe_shops_via_live(self, shops: list):
         """
-        ショップ説明をLiveAPIで読み上げ（v10 ハイブリッド方式）
+        ショップ説明をLiveAPIで読み上げ（v9 場繋ぎ連続再生+全ショップcollect統一方式）
 
         【フロー】
-        1. 2軒目以降のcollect並行生成を即座に開始
-        2. bridge再生（約3秒）→ 場繋ぎ再生完了待ち
-        3. 1軒目ハイブリッド: 最初5秒ストリーミング（即再生→無音なし）、残りバッファ収集
-        4. 1軒目ストリーミング分の再生完了待ち中に、残りのA2E事前計算を並行実行
-        5. 残りをA2E事前計算済みで高品質emit
-        6. 2軒目以降: collect + A2E事前計算 + emit（従来通り）
+        - 全ショップのcollect並行生成を即座に開始
+        - bridge → please_wait のキャッシュ音声を連続再生（約8-9秒）で時間を稼ぐ
+        - 1軒目collect完了後、A2E事前計算 → emit（2軒目以降と同品質）
+        - 全ショップ統一のcollect+precompute A2E方式でリップシンク品質を均一化
         """
         total = len(shops)
         if total == 0:
             return
 
-        # ── 2軒目以降の並行生成を即座に開始 ──
-        remaining_tasks = []
-        for i in range(1, total):
+        # ── 全ショップの並行生成を即座に開始 ──
+        all_tasks = []
+        for i in range(total):
             task = asyncio.create_task(
                 self._collect_shop_audio(shops[i], i + 1, total)
             )
-            remaining_tasks.append(task)
+            all_tasks.append(task)
 
-        # ── A2Eリセット + 場繋ぎ再生 ──
+        # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)
         self._a2e_chunk_index = 0
         self._a2e_audio_buffer = bytearray()
 
+        # ── 場繋ぎ: bridge → please_wait を連続再生（約8-9秒）──
         bridge_start = time.time()
-        bridge_duration = 0.0
+        total_bridge_duration = 0.0
+
+        # 1) bridge: 「お待たせしました。それではお薦めのお店をご紹介します。」
         if _CACHED_BRIDGE_PCM:
             await self._emit_cached_audio(_CACHED_BRIDGE_PCM)
-            bridge_duration = len(_CACHED_BRIDGE_PCM) / 48000
-            logger.info(f"[ShopDesc] 場繋ぎ(bridge)再生: {bridge_duration:.1f}秒")
+            dur = len(_CACHED_BRIDGE_PCM) / 48000
+            total_bridge_duration += dur
+            logger.info(f"[ShopDesc] 場繋ぎ1(bridge)再生: {dur:.1f}秒")
 
-        # 場繋ぎ再生完了を待つ
+        # bridge再生完了を待ってからplease_waitへ
         elapsed = time.time() - bridge_start
-        wait_bridge = max(bridge_duration - elapsed + 0.3, 0.3)
-        await asyncio.sleep(wait_bridge)
+        wait1 = max(total_bridge_duration - elapsed + 0.3, 0.3)
+        await asyncio.sleep(wait1)
 
-        # ── 1軒目: ハイブリッド（5秒ストリーミング → 残りバッファ）──
-        remaining_chunks_1, transcript_1, streamed_bytes_1 = await self._hybrid_stream_collect_shop(
-            shops[0], 1, total, stream_seconds=5.0
-        )
+        # 2) please_wait: 「只今、お店の情報を確認中です。もう少々お待ち下さい」
+        if _CACHED_PLEASE_WAIT_PCM:
+            await self._emit_cached_audio(_CACHED_PLEASE_WAIT_PCM)
+            dur = len(_CACHED_PLEASE_WAIT_PCM) / 48000
+            total_bridge_duration += dur
+            logger.info(f"[ShopDesc] 場繋ぎ2(please_wait)再生: {dur:.1f}秒")
 
-        # 1軒目ストリーミング分の再生完了を待つ + 残りのA2E事前計算を並行
+        # ── 場繋ぎ再生中に1軒目のcollect完了を待つ + A2E事前計算 ──
         next_a2e_task = None
-        if streamed_bytes_1 > 0:
-            stream_duration = streamed_bytes_1 / 48000
-            elapsed = 0.0
-            if hasattr(self, '_stream_start_time') and self._stream_start_time:
-                elapsed = time.time() - self._stream_start_time
-            remaining_sleep = max(stream_duration - elapsed + 0.3, 0.5)
-            logger.info(f"[ShopDesc] 1軒目ストリーム再生待ち: 全長{stream_duration:.1f}秒, 経過{elapsed:.1f}秒, sleep{remaining_sleep:.1f}秒")
+        audio_chunks_1, transcript_1 = await all_tasks[0]
+        if audio_chunks_1:
+            next_a2e_task = asyncio.create_task(
+                self._precompute_a2e_expressions(b''.join(audio_chunks_1))
+            )
 
-            # ストリーム再生待ち中に、1軒目残り部分のA2E事前計算を開始
-            if remaining_chunks_1:
-                remaining_pcm = b''.join(remaining_chunks_1)
-                next_a2e_task = asyncio.create_task(
-                    self._precompute_a2e_expressions(remaining_pcm)
-                )
+        # please_wait再生完了を待つ
+        elapsed = time.time() - bridge_start
+        remaining_sleep = max(total_bridge_duration - elapsed + 0.3, 0.5)
+        logger.info(f"[ShopDesc] 場繋ぎ残り待ち: {remaining_sleep:.1f}秒 (経過{elapsed:.1f}秒, 場繋ぎ合計{total_bridge_duration:.1f}秒)")
+        await asyncio.sleep(remaining_sleep)
 
-            await asyncio.sleep(remaining_sleep)
-
-        # 1軒目の残りをA2E事前計算済みで高品質emit
-        if remaining_chunks_1:
-            a2e_result = None
-            if next_a2e_task:
-                a2e_result = await next_a2e_task
-                next_a2e_task = None
-            await self._emit_collected_shop(remaining_chunks_1, "", 1, a2e_result)
-
-            # 残り部分の再生完了を待つ + 2軒目のA2E事前計算を並行
-            remaining_pcm = b''.join(remaining_chunks_1)
-            remaining_duration = len(remaining_pcm) / 48000
-            logger.info(f"[ShopDesc] 1軒目残り再生待ち: {remaining_duration:.1f}秒")
-
-            if remaining_tasks:
-                audio_chunks_2, _ = await remaining_tasks[0]
-                if audio_chunks_2:
-                    next_a2e_task = asyncio.create_task(
-                        self._precompute_a2e_expressions(b''.join(audio_chunks_2))
-                    )
-
-            await asyncio.sleep(remaining_duration + 0.3)
-        else:
-            # 残りなし（全部ストリーミングで送信済み）→ 2軒目のA2E事前計算
-            if remaining_tasks:
-                audio_chunks_2, _ = await remaining_tasks[0]
-                if audio_chunks_2:
-                    next_a2e_task = asyncio.create_task(
-                        self._precompute_a2e_expressions(b''.join(audio_chunks_2))
-                    )
-
-        # 1軒目のトランスクリプトを履歴に追加
-        if transcript_1:
-            self._add_to_history("ai", transcript_1)
-
-        # ── 2軒目以降: 生成済み音声を順次再生 ──
-        for i, task in enumerate(remaining_tasks):
+        # ── 全ショップ: collect済み音声を順次再生（1軒目も同じパス）──
+        for i, task in enumerate(all_tasks):
             if not self.is_running:
                 break
             try:
                 audio_chunks, transcript = await task
 
+                # このショップのA2E事前計算結果を取得
                 a2e_result = None
                 if next_a2e_task:
                     a2e_result = await next_a2e_task
                     next_a2e_task = None
 
                 if audio_chunks:
-                    await self._emit_collected_shop(audio_chunks, transcript, i + 2, a2e_result)
+                    await self._emit_collected_shop(audio_chunks, transcript, i + 1, a2e_result)
 
+                    # ★ 音声再生完了を待ってから次のショップへ（A2E同期崩壊防止）
                     all_pcm = b''.join(audio_chunks)
                     audio_duration = len(all_pcm) / 48000
-                    logger.info(f"[ShopDesc] ショップ{i+2}再生待ち: {audio_duration:.1f}秒")
+                    logger.info(f"[ShopDesc] ショップ{i+1}再生待ち: {audio_duration:.1f}秒")
 
                     # 次のショップのA2E事前計算をsleep待ち中に開始
-                    if i + 1 < len(remaining_tasks):
-                        next_chunks, _ = await remaining_tasks[i + 1]
+                    if i + 1 < len(all_tasks):
+                        next_chunks, _ = await all_tasks[i + 1]
                         if next_chunks:
                             next_a2e_task = asyncio.create_task(
                                 self._precompute_a2e_expressions(b''.join(next_chunks))
@@ -1000,7 +967,7 @@ class LiveAPISession:
 
                     await asyncio.sleep(audio_duration + 0.3)
             except Exception as e:
-                logger.error(f"[ShopDesc] ショップ{i+2}生成エラー: {e}")
+                logger.error(f"[ShopDesc] ショップ{i+1}生成エラー: {e}")
 
         # 全ショップ説明完了 → 通常会話に復帰
         summary = f"{total}軒のお店を紹介しました。気になるお店はありましたか？"
@@ -1008,19 +975,8 @@ class LiveAPISession:
         self._resume_message = "ありがとうございます。気になるお店について教えてください。"
         self.needs_reconnect = True  # 通常会話に復帰するために再接続
 
-    async def _hybrid_stream_collect_shop(self, shop, shop_number: int, total: int,
-                                          stream_seconds: float = 5.0):
-        """1軒目用ハイブリッド方式: 最初のN秒はストリーミング再生、残りはバッファ収集
-
-        Args:
-            stream_seconds: ストリーミング再生する秒数（デフォルト5秒）
-
-        Returns:
-            (remaining_chunks, transcript, streamed_bytes):
-                remaining_chunks: ストリーミング後のバッファ済み音声チャンク（A2E事前計算用）
-                transcript: 全体のトランスクリプト
-                streamed_bytes: ストリーミング再生した合計バイト数
-        """
+    async def _stream_single_shop(self, shop, shop_number: int, total: int):
+        """1軒目用: 音声を直接ブラウザにストリーミング"""
         is_last = (shop_number == total)
         shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
@@ -1041,22 +997,16 @@ class LiveAPISession:
         if is_last:
             shop_instruction += f"5の代わりに: 最後のお店です。紹介後「以上、{total}軒のお店をご紹介しました。気になるお店はありましたか？」で締めてください。\n"
 
-        stream_threshold = int(48000 * stream_seconds)  # 5秒 = 240,000 bytes
-        streamed_bytes = 0
-        remaining_chunks = []
-        transcript = ""
-        streaming_phase = True  # True=ストリーミング中, False=バッファ収集中
-
-        config = self._build_config()
-        config["system_instruction"] = shop_instruction
-        config.pop("tools", None)
-
         try:
+            config = self._build_config()
+            config["system_instruction"] = shop_instruction
+            config.pop("tools", None)
+
             async with self.client.aio.live.connect(
                 model=LIVE_API_MODEL,
                 config=config
             ) as session:
-                trigger_text = f"検索結果を紹介してください。まず{shop_number}軒目のお店からお願いします。"
+                trigger_text = f"検索結果を紹介してください。まず1軒目のお店からお願いします。"
                 await session.send_client_content(
                     turns=types.Content(
                         role="user",
@@ -1064,80 +1014,10 @@ class LiveAPISession:
                     ),
                     turn_complete=True
                 )
-
-                self._last_stream_pcm_bytes = 0
-                self._stream_start_time = None
-
-                turn = session.receive()
-                async for response in turn:
-                    if not self.is_running:
-                        break
-
-                    if response.server_content:
-                        sc = response.server_content
-
-                        if hasattr(sc, 'turn_complete') and sc.turn_complete:
-                            if streaming_phase:
-                                # ストリーミング中に終了 → A2E残存バッファをフラッシュ
-                                await self._flush_a2e_buffer(force=True, is_final=True)
-                                self._a2e_chunk_index = 0
-                            if self.ai_transcript_buffer.strip():
-                                transcript += self.ai_transcript_buffer.strip()
-                                self.ai_transcript_buffer = ""
-                            break
-
-                        # トランスクリプション
-                        if (hasattr(sc, 'output_transcription')
-                                and sc.output_transcription
-                                and sc.output_transcription.text):
-                            text = sc.output_transcription.text
-                            if streaming_phase:
-                                self.ai_transcript_buffer += text
-                                self.socketio.emit('ai_transcript',
-                                                   {'text': text, 'type': 'shop_description'},
-                                                   room=self.client_sid)
-                                self._on_output_transcription(text)
-                            else:
-                                transcript += text
-
-                        # 音声データ
-                        if sc.model_turn:
-                            for part in sc.model_turn.parts:
-                                if (hasattr(part, 'inline_data')
-                                        and part.inline_data
-                                        and isinstance(part.inline_data.data, bytes)):
-                                    chunk_data = part.inline_data.data
-
-                                    if streaming_phase:
-                                        # ── ストリーミングフェーズ: ブラウザに即送信 + リアルタイムA2E ──
-                                        audio_b64 = base64.b64encode(chunk_data).decode('utf-8')
-                                        self.socketio.emit('live_audio', {'data': audio_b64},
-                                                           room=self.client_sid)
-                                        self._buffer_for_a2e(chunk_data)
-                                        if self._stream_start_time is None:
-                                            self._stream_start_time = time.time()
-                                        self._last_stream_pcm_bytes += len(chunk_data)
-                                        streamed_bytes += len(chunk_data)
-
-                                        # 閾値到達 → バッファ収集フェーズに切り替え
-                                        if streamed_bytes >= stream_threshold:
-                                            await self._flush_a2e_buffer(force=True, is_final=True)
-                                            self._a2e_chunk_index = 0
-                                            streaming_phase = False
-                                            # トランスクリプトを確定
-                                            if self.ai_transcript_buffer.strip():
-                                                transcript += self.ai_transcript_buffer.strip()
-                                                self.ai_transcript_buffer = ""
-                                            logger.info(f"[ShopDesc] ショップ{shop_number}: ストリーミング→バッファ切替 ({streamed_bytes} bytes, {streamed_bytes/48000:.1f}秒)")
-                                    else:
-                                        # ── バッファ収集フェーズ: 貯めるだけ ──
-                                        remaining_chunks.append(chunk_data)
+                await self._receive_shop_description(session, shop_number)
 
         except Exception as e:
-            logger.error(f"[ShopDesc] ショップ{shop_number}ハイブリッドエラー: {e}")
-
-        logger.info(f"[ShopDesc] ショップ{shop_number}ハイブリッド完了: ストリーミング{streamed_bytes/48000:.1f}秒, 残り{len(remaining_chunks)}チャンク, {len(transcript)}文字")
-        return remaining_chunks, transcript, streamed_bytes
+            logger.error(f"[ShopDesc] ショップ{shop_number}ストリーミングエラー: {e}")
 
     async def _collect_shop_audio(self, shop, shop_number: int, total: int):
         """2軒目以降用: LiveAPI接続して音声をバッファに収集（ブラウザには送信しない）"""
