@@ -131,9 +131,9 @@ def build_system_instruction(mode: str, user_profile: dict = None,
         logger.warning("[LiveAPI] system_prompts が未設定。プロンプトが空になります。")
 
     if mode == 'concierge':
-        # ユーザープロファイルに応じた初期あいさつ指示を構築（末尾追記）
+        # ユーザープロファイルに応じた初期あいさつ指示を構築
         user_context = _build_concierge_user_context(user_profile)
-        return base_prompt + "\n" + user_context
+        return base_prompt.format(user_context=user_context)
     else:
         return base_prompt
 
@@ -608,7 +608,15 @@ class LiveAPISession:
                         task.cancel()
                         logger.info(f"[CachedAudio] {name}: 検索完了によりスキップ")
 
-                # tool_response送信は省略（エラー回避のため即終了）
+                # function responseを返す（LiveAPI confirmed syntax）
+                tool_response = types.LiveClientToolResponse(
+                    function_responses=[types.FunctionResponse(
+                        name=fc.name,
+                        id=fc.id,
+                        response={"result": "検索結果をユーザーに表示しました"}
+                    )]
+                )
+                await session.send_tool_response(tool_response)
             else:
                 logger.warning(f"[LiveAPI] 未知のfunction call: {fc.name}")
 
@@ -655,39 +663,20 @@ class LiveAPISession:
             tts_shops = copy.deepcopy(raw_shops)
             total = len(tts_shops)
             all_tts_tasks = []
+            for i in range(total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(tts_shops[i], i + 1, total)
+                )
+                all_tts_tasks.append(task)
+            logger.info(f"[ShopSearch] ★ TTS {total}軒の並行生成を開始（enrich前）")
 
-            # ショップ1: 即座に開始（競合なしで最速セッション確立）
-            task1 = asyncio.create_task(
-                self._collect_shop_audio(tts_shops[0], 1, total)
-            )
-            all_tts_tasks.append(task1)
-            logger.info(f"[ShopSearch] ★ ショップ1 TTS先行開始（enrich前）")
-
-            # ショップ2-5: 2秒後に開始（create_taskでラップし、enrichと並行）
-            async def _start_remaining_tts():
-                await asyncio.sleep(2.0)
-                tasks = []
-                for i in range(1, total):
-                    t = asyncio.create_task(
-                        self._collect_shop_audio(tts_shops[i], i + 1, total)
-                    )
-                    tasks.append(t)
-                logger.info(f"[ShopSearch] ★ ショップ2-{total} TTS開始（2秒遅延）")
-                return tasks
-
-            remaining_tts_future = asyncio.create_task(_start_remaining_tts())
-
-            # 3. ★ enrichをTTS生成と並行実行（sleepでブロックしない）
+            # 3. ★ enrichをTTS生成と並行実行
             from api_integrations import enrich_shops_with_photos
             enriched = await loop.run_in_executor(
                 None, enrich_shops_with_photos, raw_shops, area, self.language
             )
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
-
-            # 残りのTTSタスクを回収
-            remaining_tasks = await remaining_tts_future
-            all_tts_tasks.extend(remaining_tasks)
 
             # 4. ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
@@ -765,25 +754,11 @@ class LiveAPISession:
             logger.info(f"[ShopDesc] 事前生成済みTTSタスク {len(all_tasks)}件を使用")
         else:
             all_tasks = []
-            # ショップ1: 即座に開始
-            task1 = asyncio.create_task(
-                self._collect_shop_audio(shops[0], 1, total)
-            )
-            all_tasks.append(task1)
-            # ショップ2-5: 2秒後に開始（create_taskでラップ）
-            if total > 1:
-                async def _start_remaining():
-                    await asyncio.sleep(2.0)
-                    tasks = []
-                    for i in range(1, total):
-                        t = asyncio.create_task(
-                            self._collect_shop_audio(shops[i], i + 1, total)
-                        )
-                        tasks.append(t)
-                    return tasks
-                remaining_future = asyncio.create_task(_start_remaining())
-                remaining = await remaining_future
-                all_tasks.extend(remaining)
+            for i in range(total):
+                task = asyncio.create_task(
+                    self._collect_shop_audio(shops[i], i + 1, total)
+                )
+                all_tasks.append(task)
 
         # ── A2Eリセット ──
         self.socketio.emit('live_expression_reset', room=self.client_sid)

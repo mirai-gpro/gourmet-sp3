@@ -791,17 +791,20 @@ def handle_live_start(data):
                 return None
             session.update_language(lang)
             session.update_mode(search_mode)
-
-            # 検索発火以降はグルメモードと完全同一のプロンプト・ロジックを使用
-            # concierge_ja.txtはLiveAPI対話用（ヒアリングフロー指示あり）
-            # REST API検索にはsupport_system_ja.txt（即JSON返却指示）を使う
-            search_prompts = {'concierge': SYSTEM_PROMPTS.get('chat', {})}
-            session.add_message('user', user_request, 'chat')
-            assistant = SupportAssistant(session, search_prompts)
-            result = assistant.process_user_message(user_request, 'conversation')
-            session.add_message('model', result['response'], 'chat')
-
+            # ★ LiveAPIのfunction calling経由の検索リクエスト
+            # 会話キャッチボールはLiveAPI側で完了済み。
+            # ここではJSON形式のショップリストを返すことだけが役割。
+            search_message = (
+                f"以下の条件でお店を検索して、必ずJSON形式（shopsに5軒）で回答してください。"
+                f"会話や質問は不要です。検索結果のみ返してください。\n"
+                f"条件: {user_request}"
+            )
+            session.add_message('user', search_message, 'chat')
+            assistant = SupportAssistant(session, SYSTEM_PROMPTS)
+            result = assistant.process_user_message(search_message, 'conversation')
             if result.get('shops'):
+                session.add_message('model', result['response'], 'chat')
+                # ★ 案A: enrichはlive_api_handler側でTTS生成と並行実行するため、ここではareaのみ返す
                 area = extract_area_from_text(user_request, lang)
                 result['area'] = area
             return result
