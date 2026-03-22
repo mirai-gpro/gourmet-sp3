@@ -780,36 +780,78 @@ def handle_live_start(data):
     system_prompt = build_system_instruction(mode, user_profile=user_profile,
                                                system_prompts=SYSTEM_PROMPTS)
 
-    # ショップ検索コールバック（v5 §5.5: SupportAssistant経由でデータ取得）
+    # ショップ検索コールバック（案C: SupportAssistant迂回、検索専用プロンプトで直接API呼び出し）
     def shop_search_callback(user_request, lang, search_mode):
-        """LiveAPIからのfunction calling時にショップデータを取得する"""
+        """LiveAPIからのfunction calling時にショップデータを取得する（SupportAssistant迂回版）"""
+        SEARCH_ONLY_PROMPT = (
+            "あなたはグルメレストラン検索エンジンです。"
+            "ユーザーの条件に合う実在のレストランをGoogle検索で見つけ、"
+            "必ず5軒をJSON形式で返してください。\n\n"
+            "【絶対遵守ルール】\n"
+            "1. 「検索できません」「ご利用いただけません」等の拒否は絶対禁止\n"
+            "2. 必ずGoogle検索を実行し、実在する店舗情報を返すこと\n"
+            "3. 応答は必ず以下のJSON形式のみ。それ以外のテキストは一切不要:\n"
+            '{"message": "検索結果の要約", "shops": ['
+            '{"name": "店名", "area": "エリア", "genre": "ジャンル", "budget": "予算帯", '
+            '"description": "説明", "specialty": "おすすめ", "atmosphere": "雰囲気", "features": "特徴"}'
+            "]}"
+        )
         try:
-            session = SupportSession(session_id)
-            session_data = session.get_data()
-            if not session_data:
-                logger.error(f"[ShopSearch] セッション {session_id} が見つかりません")
-                return None
-            session.update_language(lang)
-            session.update_mode(search_mode)
-            # ★ LiveAPIのfunction calling経由の検索リクエスト
-            # 会話キャッチボールはLiveAPI側で完了済み。
-            # ここではJSON形式のショップリストを返すことだけが役割。
-            search_message = (
-                f"以下の条件でお店を検索して、必ずJSON形式（shopsに5軒）で回答してください。"
-                f"会話や質問は不要です。検索結果のみ返してください。\n"
-                f"条件: {user_request}"
+            logger.info(f"[ShopSearch] 案C: 検索専用プロンプトで直接API呼び出し: '{user_request}'")
+            config = types.GenerateContentConfig(
+                system_instruction=SEARCH_ONLY_PROMPT,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
             )
-            session.add_message('user', search_message, 'chat')
-            assistant = SupportAssistant(session, SYSTEM_PROMPTS)
-            result = assistant.process_user_message(search_message, 'conversation')
-            if result.get('shops'):
-                session.add_message('model', result['response'], 'chat')
-                # ★ 案A: enrichはlive_api_handler側でTTS生成と並行実行するため、ここではareaのみ返す
+            response = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[{"role": "user", "parts": [{"text": f"検索条件: {user_request}"}]}],
+                config=config
+            )
+            assistant_text = response.text
+            logger.info(f"[ShopSearch] 案C: Gemini応答 {len(assistant_text)}文字: {assistant_text[:200]}")
+
+            # JSON解析（extract_shops_from_responseでフォールバック）
+            import json as _json
+            shops = []
+            response_msg = assistant_text
+            try:
+                # JSON部分を抽出
+                text = assistant_text.strip()
+                start = text.find('{')
+                if start >= 0:
+                    brace_count = 0
+                    end = -1
+                    for i in range(start, len(text)):
+                        if text[i] == '{': brace_count += 1
+                        elif text[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end = i + 1
+                                break
+                    if end > 0:
+                        data = _json.loads(text[start:end])
+                        response_msg = data.get('message', assistant_text)
+                        shops = data.get('shops', [])
+            except _json.JSONDecodeError as e:
+                logger.warning(f"[ShopSearch] 案C: JSONパース失敗: {e}")
+                from api_integrations import extract_shops_from_response
+                shops = extract_shops_from_response(assistant_text)
+
+            logger.info(f"[ShopSearch] 案C: {len(shops)}件のショップを取得")
+
+            result = {
+                'response': response_msg,
+                'shops': shops,
+                'summary': f"{len(shops)}軒のお店を提案しました。" if shops else None,
+                'should_confirm': True,
+                'is_followup': False,
+            }
+            if shops:
                 area = extract_area_from_text(user_request, lang)
                 result['area'] = area
             return result
         except Exception as e:
-            logger.error(f"[ShopSearch] コールバックエラー: {e}", exc_info=True)
+            logger.error(f"[ShopSearch] 案C: エラー: {e}", exc_info=True)
             return None
 
     # LiveAPIセッション作成
