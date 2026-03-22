@@ -665,10 +665,10 @@ class LiveAPISession:
             all_tts_tasks = []
             for i in range(total):
                 task = asyncio.create_task(
-                    self._collect_shop_audio(tts_shops[i], i + 1, total)
+                    self._collect_shop_audio(tts_shops[i], i + 1, total, delay=0 if i == 0 else 3)
                 )
                 all_tts_tasks.append(task)
-            logger.info(f"[ShopSearch] ★ TTS {total}軒の並行生成を開始（enrich前）")
+            logger.info(f"[ShopSearch] ★ TTS {total}軒の並行生成を開始（1軒目即時、2軒目以降3秒遅延）")
 
             # 3. ★ enrichをTTS生成と並行実行
             from api_integrations import enrich_shops_with_photos
@@ -677,6 +677,16 @@ class LiveAPISession:
             )
             shops = enriched if enriched else raw_shops
             logger.info(f"[ShopSearch] enrich完了: {len(shops)}件")
+
+            # 3.5. enrichで除外された店のTTSタスクをフィルタリング
+            if len(all_tts_tasks) != len(shops):
+                survived_names = {s.get('name') for s in shops}
+                filtered_tasks = []
+                for i, ts in enumerate(tts_shops):
+                    if ts.get('name') in survived_names:
+                        filtered_tasks.append(all_tts_tasks[i])
+                all_tts_tasks = filtered_tasks
+                logger.info(f"[ShopSearch] TTSタスクをフィルタリング: {len(all_tts_tasks)}件に絞り込み")
 
             # 4. ショップカードデータをブラウザに送信
             self.socketio.emit('shop_search_result', {
@@ -756,7 +766,7 @@ class LiveAPISession:
             all_tasks = []
             for i in range(total):
                 task = asyncio.create_task(
-                    self._collect_shop_audio(shops[i], i + 1, total)
+                    self._collect_shop_audio(shops[i], i + 1, total, delay=0 if i == 0 else 3)
                 )
                 all_tasks.append(task)
 
@@ -885,8 +895,10 @@ class LiveAPISession:
         except Exception as e:
             logger.error(f"[ShopDesc] ショップ{shop_number}ストリーミングエラー: {e}")
 
-    async def _collect_shop_audio(self, shop, shop_number: int, total: int):
+    async def _collect_shop_audio(self, shop, shop_number: int, total: int, delay: float = 0):
         """2軒目以降用: LiveAPI接続して音声をバッファに収集（ブラウザには送信しない）"""
+        if delay > 0:
+            await asyncio.sleep(delay)
         is_last = (shop_number == total)
         shop_context = self._format_shop_for_prompt(shop, shop_number, total)
 
