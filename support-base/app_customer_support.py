@@ -777,7 +777,8 @@ def handle_live_start(data):
         except Exception as e:
             logger.warning(f"[LiveAPI] プロファイル取得エラー: {e}")
 
-    system_prompt = build_system_instruction(mode, user_profile=user_profile)
+    system_prompt = build_system_instruction(mode, user_profile=user_profile,
+                                               system_prompts=SYSTEM_PROMPTS)
 
     # ショップ検索コールバック（v5 §5.5: SupportAssistant経由でデータ取得）
     def shop_search_callback(user_request, lang, search_mode):
