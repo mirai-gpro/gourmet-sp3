@@ -133,7 +133,7 @@ def build_system_instruction(mode: str, user_profile: dict = None,
     if mode == 'concierge':
         # ユーザープロファイルに応じた初期あいさつ指示を構築
         user_context = _build_concierge_user_context(user_profile)
-        return base_prompt.format(user_context=user_context)
+        return base_prompt.replace('{user_context}', user_context)
     else:
         return base_prompt
 
